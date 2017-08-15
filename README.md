@@ -1,6 +1,6 @@
 `rush` is a new command line shell inspired by, and implemented in, the Rust
 programming language. It is still in early development. Focus so far has been
-on the core language engine and novel. Many expected of the normal, expected
+on the core language engine and novel features. Many expected of the normal, expected
 features of shells are not yet in place. As such, production usage of `rush`
 is not advisable, but feedback and contributions are welcome.
 
