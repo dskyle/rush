@@ -1,0 +1,7 @@
+fn for_each(range, operation) {
+  for x : $range {
+    echo $x ${$operation $x}
+  }
+}
+
+for_each(0 ... 10, {|x| add $x $x})

@@ -1,0 +1,6 @@
+match $_args[1...] {
+    (/^[a-z]+$/,) => { echo Word! },
+    (0...9,) => { echo Single Digit },
+    (10...99,) => { echo Double Digit },
+    "hello" x "world" y z => { echo "$x   $y   $z" }
+}

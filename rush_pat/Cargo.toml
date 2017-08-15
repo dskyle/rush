@@ -1,0 +1,7 @@
+[package]
+name = "rush_pat"
+version = "0.1.0"
+authors = ["David Kyle <david.kyle@gmail.com>"]
+
+[dependencies]
+regex = "*"

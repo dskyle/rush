@@ -1,0 +1,52 @@
+let array = 0 1 2 3 4 5 6 7 8 9
+
+echo $array
+
+array[2] = 10
+
+echo $array
+
+let x = 4
+
+echo $array[$x]
+
+array[$x] = 14
+
+echo $array[Range(Int(0), Int($x))]
+
+echo $array[-4...-2]
+
+array[-1] = 90
+
+echo $array
+
+array[-15] = -10
+
+repr $array
+
+new[-5] = 0
+
+repr $new
+
+let dict = (("asdf", ()),)
+repr $dict
+
+dict["asdf"] = "qwerty"
+dict["foo"] = "bar"
+repr $dict
+
+new_dict["zxcv"] = (1, 2, 3)
+repr $new_dict
+
+new_dict["zxcv"] = 1
+repr $new_dict
+
+new_dict["zxcv"] = 2
+repr $new_dict
+
+new_dict["xcvb"] = 42
+repr $new_dict
+
+scalar = 84
+scalar["vbnm"] = 48
+repr $scalar

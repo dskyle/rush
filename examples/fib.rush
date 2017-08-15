@@ -1,0 +1,9 @@
+fn fib(...1) {
+    return 1
+}
+
+fn fib(x) {
+    return $add($fib($add($x, -1)), $fib($add($x, -2)))
+}
+
+echo $fib($_args[1])

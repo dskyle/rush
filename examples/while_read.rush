@@ -1,0 +1,10 @@
+# Demonstrate modifying local variable from within a pipeline
+# this works because the modification happens from the last stage; other
+# stages run in a forked subshell, so can't modify locals
+
+let x = "x"
+ls | while read l {
+  echo found $l
+  x = "$x x"
+}
+echo $x

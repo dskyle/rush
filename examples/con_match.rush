@@ -1,0 +1,5 @@
+let x = Foo(2)
+match $x {
+  { y = Foo(_) } => { echo is a foo: $y },
+  { y = Bar(_) } => { echo is a bar: $y },
+}

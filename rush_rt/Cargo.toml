@@ -1,0 +1,21 @@
+[package]
+name = "rush_rt"
+version = "0.1.0"
+authors = ["David Kyle <david.kyle@gmail.com>"]
+
+[dependencies]
+lazy_static = "0.2.2"
+regex = "*"
+num-traits = "*"
+
+[dependencies.into_val_derive]
+path = "../into_val_derive"
+version = "*"
+
+[dependencies.rush_pat]
+path = "../rush_pat"
+version = "*"
+
+[dependencies.rush_parser]
+path = "../rush_parser"
+version = "*"
