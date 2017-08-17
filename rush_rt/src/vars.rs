@@ -41,6 +41,16 @@ impl Variable {
     pub fn get_mut(&self) -> RefMut<Val> {
         self.val.borrow_mut()
     }
+
+    /// Take and return value of variable; replace with ()
+    pub fn take(&self) -> Val {
+        let mut r = self.val.borrow_mut();
+        let mut tmp = Val::void();
+
+        use std::ops::DerefMut;
+        ::std::mem::swap(&mut tmp, r.deref_mut());
+        return tmp;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +93,10 @@ pub struct LocalVars {
 impl LocalVars {
     pub fn new() -> LocalVars {
         LocalVars{vars: vec![], scopes: vec![0]}
+    }
+
+    pub fn last(&self) -> Option<&VarRef> {
+        self.vars.last().map(|x| &x.1)
     }
 }
 

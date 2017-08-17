@@ -36,7 +36,7 @@ pub use func::Control;
 use rush_rt::val::InternalIterable;
 use std::borrow::Cow;
 
-mod util {
+pub mod util {
     use rush_pat::range::Range;
     use rush_rt::range::RangeExt;
     use std::process::Command;
@@ -310,6 +310,18 @@ mod util {
                           Val::Str(pid.to_string())]) }).collect();
         Val::Tup(jobs)
     }
+
+    pub fn file2string(fname: &str) -> String {
+        use std::fs::File;
+        use std::io::BufReader;
+        use std::io::Read;
+
+        let file = File::open(fname).unwrap();
+        let mut buf_reader = BufReader::new(file);
+        let mut contents = String::new();
+        buf_reader.read_to_string(&mut contents).unwrap();
+        contents
+    }
 }
 
 mod builtins {
@@ -413,14 +425,20 @@ mod builtins {
         val
     }
 
-    pub fn eval(i: &Interp, locs: &mut LocalVars) -> Val
+    pub fn eval(i: &Interp, locs: &mut LocalVars, args: Val) -> Val
     {
-        let cmd = {
-            let arg = locs.get("args").unwrap();
-            arg.get_ref().iter().flatten().iter().join(" ")
-        };
+        let cmd = args.iter().flatten().iter().join(" ");
         let mut lex = ::rush_parser::lex::ContextLexer::new();
         let parsed = ::rush_parser::parse::parse(lex.lex(cmd.as_ref()));
+        let (v, _) = i.exec_stmt_list(&mut parsed.unwrap(), locs);
+        v
+    }
+
+    pub fn source(i: &Interp, locs: &mut LocalVars, args: Val) -> Val
+    {
+        let contents = util::file2string(args.get_str().expect("source takes one argument: file name"));
+        let mut lex = ::rush_parser::lex::ContextLexer::new();
+        let parsed = ::rush_parser::parse::parse(lex.lex(&contents));
         let (v, _) = i.exec_stmt_list(&mut parsed.unwrap(), locs);
         v
     }
@@ -562,7 +580,8 @@ impl Processor {
         {
             let mut fns = interp.funcs.borrow_mut();
             fns.reg(Func::built_in(mk_wild_pat("system"), builtins::system));
-            fns.reg(Func::built_in(mk_wild_pat("eval"), builtins::eval));
+            fns.reg(Func::mac("eval", builtins::eval));
+            fns.reg(Func::mac("source", builtins::source));
             fns.reg(Func::built_in(mk_wild_pat("echo"), builtins::echo));
             fns.reg(Func::built_in(mk_wild_pat("repr"), builtins::repr));
             fns.reg(Func::built_in(mk_wild_pat("debug"), builtins::debug));

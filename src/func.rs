@@ -10,9 +10,11 @@ use std::borrow::Cow;
 use std::fmt;
 
 type BuiltinFn = fn(&Interp, &mut LocalVars) -> Val;
+type MacroFn = fn(&Interp, &mut LocalVars, Val) -> Val;
 
 pub enum FuncBody {
     BuiltIn(BuiltinFn),
+    Macro(MacroFn),
     User(Vec<ExprS>),
 }
 
@@ -20,6 +22,7 @@ impl Clone for FuncBody {
     fn clone(&self) -> Self {
         match *self {
             FuncBody::BuiltIn(f) => FuncBody::BuiltIn(f),
+            FuncBody::Macro(m) => FuncBody::Macro(m),
             FuncBody::User(ref v) => FuncBody::User(v.clone()),
         }
     }
@@ -30,9 +33,10 @@ impl PartialEq for FuncBody {
         use self::FuncBody::*;
 
         match (self, o) {
-            (&User(..), &BuiltIn(..)) | (&BuiltIn(..), &User(..)) => false,
             (&User(ref sv), &User(ref ov)) => sv == ov,
             (&BuiltIn(ref sf), &BuiltIn(ref of)) => sf as *const _ == of as *const _,
+            (&Macro(ref m), &Macro(ref om)) => m as *const _ == om as *const _,
+            _ => false,
         }
     }
 }
@@ -43,6 +47,7 @@ impl fmt::Debug for FuncBody {
 
         match *self {
             BuiltIn(_) => write!(f, "<built-in>"),
+            Macro(_) => write!(f, "<built-in macro>"),
             User(ref v) => write!(f, "{{{:?}}}", v),
         }
     }
@@ -65,6 +70,13 @@ impl Func {
         use self::FuncBody::*;
 
         Func{args: args, body: BuiltIn(f)}
+    }
+
+    pub fn mac(name: &str, f: MacroFn) -> Func {
+        use self::FuncBody::*;
+        use self::Pat::*;
+
+        Func{args: Tup(vec![Str(name.into()), Wild(vec![ID(String::new())])]), body: Macro(f)}
     }
 
     pub fn user(args: Pat, f: Vec<ExprS>) -> Func {

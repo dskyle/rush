@@ -101,83 +101,190 @@ impl Interp {
         }
     }
 
-    fn do_set(_op: SetOp, id: &str, index: Indexing, val: Val, local_vars: &mut LocalVars) {
+    fn do_set(op: SetOp, id: &str, index: Indexing, val: Val, local_vars: &mut LocalVars) {
         use self::Val::*;
+
+        fn apply_op(op: SetOp, cur: &mut Val, new: Val) {
+            use self::SetOp::*;
+            match op {
+                Assign => *cur = new,
+                AssignIfNull => if cur.is_void() {
+                    *cur = new;
+                },
+                Suffix => match cur {
+                    &mut Val::Tup(ref mut v) => {
+                        v.push(new);
+                    },
+                    _ => {
+                        let mut tmp = Val::void();
+                        ::std::mem::swap(&mut tmp, cur);
+                        *cur = Val::Tup(vec![tmp, new]);
+                    },
+                },
+                Prefix => match cur {
+                    &mut Val::Tup(ref mut v) => {
+                        v.insert(0, new);
+                    },
+                    _ => {
+                        let mut tmp = Val::void();
+                        ::std::mem::swap(&mut tmp, cur);
+                        *cur = Val::Tup(vec![new, tmp]);
+                    },
+                },
+            }
+        }
+
+        use std::ops::DerefMut;
+
+        fn apply_op_var_ref(op: SetOp, r: &VarRef, val: Val) {
+            apply_op(op, r.get_mut().deref_mut(), val);
+        }
+
+        fn apply_op_void(op: SetOp, val: Val) -> Val {
+            let mut new = Val::void();
+            apply_op(op, &mut new, val);
+            return new;
+        }
+
+        fn do_set_offset(op: SetOp, var: &VarRef, index: i64, val: Val) {
+            let mut orig = var.get_mut();
+            let mut n = None;
+            match *orig {
+                Tup(ref mut v) => {
+                    if index >= 0 {
+                        let index = index as usize;
+                        if v.len() <= index {
+                            v.resize(index + 1, Val::void())
+                        }
+                        //v[index] = val;
+                        apply_op(op, &mut v[index], val);
+                    } else {
+                        let index = v.len() as i64 + index;
+                        if index < 0 {
+                            v.splice(0..0, ::std::iter::repeat(Val::void()).take(-index as usize));
+                            apply_op(op, &mut v[0], val);
+                        } else {
+                            apply_op(op, &mut v[index as usize], val);
+                        }
+                    }
+                },
+                Str(_) => {
+                    let val = apply_op_void(op, val);
+                    n = Some(Tup(new_vec_init(index, Val::void(), val)));
+                },
+                _ => panic!("Attempted to set non-scalar or tuple: {:?}", val)
+            }
+            if let Some(n) = n {
+                *orig = n;
+            }
+        }
+
+        fn do_set_dict(op: SetOp, var: &VarRef, key: &str, val: Val) {
+            let mut orig = var.get_mut();
+            let mut err = false;
+            let mut tuplefy = false;
+            match *orig {
+                Tup(ref mut v) => {
+                    for cur in v {
+                        match *cur {
+                            Tup(ref mut v) if v.len() == 2 &&
+                                    v[0].get_str().map_or(false, |x| x == key) => {
+                                apply_op(op, &mut v[1], val);
+                                return;
+                            },
+                            _ => {},
+                        }
+                    }
+                },
+                Str(_) => {
+                    tuplefy = true;
+                },
+                _ => err = true,
+            }
+            if err { panic!("Attempted to set non-scalar or tuple: {:?}", val); }
+            if tuplefy {
+                let mut o = Val::void();
+                ::std::mem::swap(&mut o, &mut *orig);
+                *orig = Tup(vec![o]);
+            }
+            if let Tup(ref mut v) = *orig {
+                let val = apply_op_void(op, val);
+                v.push(Tup(vec![Val::str(key), val]));
+            } else {
+                unreachable!();
+            }
+        }
+
+        fn do_set_range(op: SetOp, var: &VarRef, l: i64, r: i64, val: Val) {
+            if let SetOp::Assign = op {
+                fn wrap_index(index: i64, len: usize) -> i64 {
+                    if index >= 0 {
+                        index
+                    } else {
+                        len as i64 + index
+                    }
+                }
+
+                let val_into_iter = |val| {
+                    let iter = match val {
+                        Val::Tup(val) => val.into_iter(),
+                        Val::Ref(_) => vec!(Val::Embed(Box::new(val))).into_iter(),
+                        _ => vec!(val).into_iter(),
+                    };
+                    iter
+                };
+
+                let mut mut_ref = var.get_mut();
+                let cur = mut_ref.deref_mut();
+                match cur {
+                    &mut Val::Tup(ref mut cur) => {
+                        let n = cur.len() as i64;
+                        let l = wrap_index(l, n as usize);
+                        let r = wrap_index(r, n as usize);
+                        let iter = val_into_iter(val);
+                        use std::iter::repeat;
+                        if l < 0 {
+                            if r < 0 {
+                                let iter = iter.chain(repeat(Val::void()).take((-r - 1) as usize));
+                                cur.splice(0..0, iter);
+                            } else if r < n {
+                                cur.splice(0...r as usize, iter);
+                            } else {
+                                *cur = iter.collect();
+                            }
+                        } else if l < n {
+                            if r < n {
+                                cur.splice(l as usize...r as usize, iter);
+                            } else {
+                                cur.splice(l as usize..n as usize, iter);
+                            }
+                        } else {
+                            let iter = repeat(Val::void()).take((l - n) as usize).chain(iter);
+                            cur.splice(n as usize..n as usize, iter);
+                        }
+                    },
+                    _ => {
+                        unimplemented!();
+                    }
+                }
+            } else {
+                unimplemented!();
+            }
+        }
 
         if let Some(var) = local_vars.get(id) {
             //println!("Set {:?} from {:?} to {:?} using {:?}", id, old_val, val, op);
             match index {
-                Indexing::NoIndex => {
-                    var.set(val);
-                },
-                Indexing::Offset(index) => {
-                    let mut orig = var.get_mut();
-                    let mut n = None;
-                    match *orig {
-                        Tup(ref mut v) => {
-                            if index >= 0 {
-                                let index = index as usize;
-                                if v.len() <= index {
-                                    v.resize(index + 1, Val::void())
-                                }
-                                v[index] = val;
-                            } else {
-                                let index = v.len() as i64 + index;
-                                if index < 0 {
-                                    v.splice(0..0, ::std::iter::repeat(Val::void()).take(-index as usize));
-                                    v[0] = val;
-                                } else {
-                                    v[index as usize] = val;
-                                }
-                            }
-                        },
-                        Str(_) => {
-                            n = Some(Tup(new_vec_init(index, Val::void(), val)));
-                        },
-                        _ => panic!("Attempted to set non-scalar or tuple: {:?}", val)
-                    }
-                    if let Some(n) = n {
-                        *orig = n;
-                    }
-                },
-                Indexing::Dict(key) => {
-                    let mut orig = var.get_mut();
-                    let mut err = false;
-                    let mut tuplefy = false;
-                    match *orig {
-                        Tup(ref mut v) => {
-                            for cur in v {
-                                match *cur {
-                                    Tup(ref mut v) if v.len() == 2 &&
-                                            v[0].get_str().map_or(false, |x| x == key) => {
-                                        v[1] = val;
-                                        return;
-                                    },
-                                    _ => {},
-                                }
-                            }
-                        },
-                        Str(_) => {
-                            tuplefy = true;
-                        },
-                        _ => err = true,
-                    }
-                    if err { panic!("Attempted to set non-scalar or tuple: {:?}", val); }
-                    if tuplefy {
-                        let mut o = Val::void();
-                        ::std::mem::swap(&mut o, &mut *orig);
-                        *orig = Tup(vec![o]);
-                    }
-                    if let Tup(ref mut v) = *orig {
-                        v.push(Tup(vec![Val::str(key), val]));
-                    } else {
-                        unreachable!();
-                    }
-                },
+                Indexing::NoIndex => apply_op_var_ref(op, var, val),
+                Indexing::Offset(index) => do_set_offset(op, var, index, val),
+                Indexing::Dict(key) => do_set_dict(op, var, key, val),
+                Indexing::Range(Range::WithinInt(l, r)) => do_set_range(op, var, l, r, val),
                 _ => unimplemented!(),
             }
-            return;
+            return; // Use this instead of "else" to make borrow checker happy
         }
+
+        let val = apply_op_void(op, val);
         //println!("Implicit bind {:?} to {:?}", id, val);
         local_vars.bind(id, match index {
             Indexing::NoIndex => val,
@@ -220,13 +327,13 @@ impl Interp {
         panic!("Unknown sys or global var must be initialized");
     }
 
-    fn call_op_bool(&self, val: Val, span: Span) -> Val {
+    fn call_op_bool(&self, val: Val, span: Span, l: &mut LocalVars) -> Val {
         let mut v = Vec::with_capacity(2);
         v.push(Val::Str("op::bool".to_string()));
         v.push(val);
         v[1].eval();
         let t = Val::Tup(v);
-        let c = self.try_call(t, span);
+        let c = self.try_call(t, span, l);
         return match c {
             Ok(val) => val,
             Err(val) => val.take_tup().unwrap().into_iter().nth(1).unwrap(),
@@ -257,7 +364,7 @@ impl Interp {
                 if con.stops_exec() {
                     return Err((val, con));
                 }
-                let val = self.call_op_bool(val, span);
+                let val = self.call_op_bool(val, span, r);
                 match Self::val_is_truthy(&val) {
                     Some(true) => {
                         r.enter_scope();
@@ -382,7 +489,7 @@ impl Interp {
             return val
         }
         let call_iterate = Val::Tup(vec![Val::str("iter"), val.0]);
-        match self.try_call(call_iterate, ispan) {
+        match self.try_call(call_iterate, ispan, r) {
             Ok(val) => {
                 let mut cur = val;
                 loop {
@@ -401,7 +508,7 @@ impl Interp {
                         }
                     }
                     let call_next = Val::Tup(vec![Val::str("next"), cur]);
-                    match self.try_call(call_next, ispan) {
+                    match self.try_call(call_next, ispan, r) {
                         Ok(val) => {
                             cur = val;
                         },
@@ -538,7 +645,7 @@ impl Interp {
                 res
             },
             Lambda(ref c, ref p, ref b) => self.do_lambda(r, c, p, b),
-            Var(m, ref n) => (Self::get_var_ref(m, n, r), Control::Done),
+            Var(m, ref n) => (self.get_var_ref(m, n, r), Control::Done),
             Exec(m, ref n, _) => self.get_exec(m, n, r),
             Call(m, ref n, _) => self.do_call(m, n, r),
             Expr::Range(ref r) => match ::rush_parser::ast::ASTRange::from_ast_range(r.into()) {
@@ -562,11 +669,19 @@ impl Interp {
         if con.stops_exec() {
             return (val, con)
         }
-        match m {
-            SubsMode::Insert => (val, con),
-            SubsMode::Embed => (Val::Embed(Box::new(val)), con),
-            _ => unimplemented!(),
-        }
+        /*
+        val.into_with_val(|val| {
+            use std::borrow::Borrow;
+
+            if let &Val::Str(ref s) = val.borrow() {
+                return (Self::get_var_ref_id(m, s, n.1, l), con);
+            }
+        })*/
+            match m {
+                SubsMode::Insert => (val, con),
+                SubsMode::Embed => (Val::Embed(Box::new(val)), con),
+                _ => unimplemented!(),
+            }
     }
 
     fn get_exec(&self, _: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
@@ -596,26 +711,38 @@ impl Interp {
         (Val::str(buf), Control::Done)
     }
 
-    fn get_var_ref(m: SubsMode, n: &ExprS, r: &mut LocalVars) -> Val {
+    fn get_var_ref(&self, m: SubsMode, n: &ExprS, r: &mut LocalVars) -> Val {
         use self::Expr::*;
-        if let Ident(ref id) = n.0 {
-            let v = r.get(id);
-            let r = match v {
-                Some(r) => Val::Ref(r.clone()),
-                None => return Val::err(RuntimeError::UnboundVariable(id.clone()), Some(n.1)),
-            };
-            //println!("var: {:?}", r);
-            match m {
-                SubsMode::Insert => r,
-                SubsMode::Embed => Val::Embed(Box::new(r)),
-                _ => unimplemented!(),
-            }
-        } else {
-            panic!("Invalid variable identifier: {:?}", n)
+        match n.0 {
+            Ident(ref id) => self.get_var_ref_id(m, id, n.1, r),
+            Var(_, ref e) => {
+                let var = self.get_var_ref(SubsMode::Insert, e, r);
+                var.with_val(|val| {
+                    match *val {
+                        Val::Str(ref s) => self.get_var_ref_id(m, s, n.1, r),
+                        _ => self.call(val.clone(), n.1, r),
+                    }
+                })
+            },
+            _ => panic!("Invalid variable identifier: {:?}", n),
         }
     }
 
-    pub fn try_call(&self, val: Val, span: Span) -> Result<Val, Val> {
+    fn get_var_ref_id(&self, m: SubsMode, id: &str, span: Span, r: &mut LocalVars) -> Val {
+        let v = r.get(id);
+        let r = match v {
+            Some(r) => Val::Ref(r.clone()),
+            None => return Val::err(RuntimeError::UnboundVariable(id.into()), Some(span)),
+        };
+        //println!("var: {:?}", r);
+        match m {
+            SubsMode::Insert => r,
+            SubsMode::Embed => Val::Embed(Box::new(r)),
+            _ => unimplemented!(),
+        }
+    }
+
+    pub fn try_call(&self, val: Val, span: Span, l: &mut LocalVars) -> Result<Val, Val> {
         let val = match val {
             Val::Tup(_) => val,
             Val::Error(..) => return Ok(val),
@@ -627,6 +754,9 @@ impl Interp {
                 let mut val = match body {
                     FuncBody::BuiltIn(f) => {
                         f(self, &mut locals)
+                    },
+                    FuncBody::Macro(m) => {
+                        m(self, l, locals.last().unwrap().take())
                     },
                     FuncBody::User(ref vec) => {
                         let ret = self.exec_stmt_list(vec, &mut locals).0;
@@ -648,12 +778,12 @@ impl Interp {
         }
     }
 
-    pub fn call(&self, val: Val, span: Span) -> Val {
-        let mut ret = match self.try_call(val, span) {
+    pub fn call(&self, val: Val, span: Span, l: &mut LocalVars) -> Val {
+        let mut ret = match self.try_call(val, span, l) {
             Ok(val) => val,
             Err(val) => {
                 let val = Val::Tup(vec![Val::Str("system".into()), Val::Embed(Box::new(val))]);
-                self.try_call(val, span).expect("No matching fn")
+                self.try_call(val, span, l).expect("No matching fn")
             }
         };
         ret.eval();
@@ -776,7 +906,7 @@ impl Interp {
                 if con.stops_exec() {
                     (val, con)
                 } else {
-                    let val = self.call(val, span);
+                    let val = self.call(val, span, local_vars);
                     (val, Control::Done)
                 }
             },
@@ -806,7 +936,7 @@ impl Interp {
         if con.stops_exec() {
             return (val, con)
         }
-        let b = self.call_op_bool(val.clone(), lhs.1);
+        let b = self.call_op_bool(val.clone(), lhs.1, local_vars);
         match Self::val_is_truthy(&b) {
             Some(b) => {
                 if b ^ is_or {

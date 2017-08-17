@@ -76,20 +76,10 @@ fn do_interactive() {
 }
 
 fn do_file(args: Vec<String>) {
-    use std::fs::File;
-    use std::io::BufReader;
-    use std::io::Read;
+    use rush::util;
 
     assert!(args.len() > 0, "do_file requires at least 1 argument");
-    let contents = {
-        let fname = &args[0];
-        let file = File::open(fname).unwrap();
-        let mut buf_reader = BufReader::new(file);
-        let mut contents = String::new();
-        buf_reader.read_to_string(&mut contents).unwrap();
-        contents
-    };
-
+    let contents = util::file2string(&args[0]);
     let mut processor = Processor::new();
     processor.add_local("_args", Val::Tup(args.into_iter().map(|a| { Val::Str(a) }).collect()));
     processor.exec(&contents);

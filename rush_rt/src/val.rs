@@ -265,6 +265,15 @@ impl Val {
         }
     }
 
+    pub fn into_with_val<T, F: FnOnce(Cow<Val>) -> T>(self, f: F) -> T {
+        use self::Val::*;
+
+        match self {
+            Ref(ref r) => r.get_ref().with_val(|val| f(val.into())),
+            _ => f(self.into()),
+        }
+    }
+
     pub fn simplify_shallow(&mut self) {
         use self::Val::*;
 
@@ -457,6 +466,15 @@ impl Val {
 
     pub fn void() -> Val {
         Val::Tup(vec![])
+    }
+
+    pub fn is_void(&self) -> bool {
+        self.with_val(|val| {
+            match *val {
+                Val::Tup(ref v) => v.len() == 0,
+                _ => false,
+            }
+        })
     }
 
     pub fn err_str(val: &str) -> Val {
