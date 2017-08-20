@@ -3,6 +3,7 @@ name = "rush_pat"
 version = "0.1.0"
 authors = ["David Kyle <david.kyle@gmail.com>"]
 license = "MIT"
+description = "Core pattern matching engine for rush shell"
 
 [dependencies]
 regex = "*"
