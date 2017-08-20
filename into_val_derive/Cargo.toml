@@ -2,6 +2,8 @@
 name = "into_val_derive"
 version = "0.1.0"
 authors = ["David Kyle <david.kyle@gmail.com>"]
+license = "MIT"
+description = "custom derive for rush shell"
 
 [lib]
 proc-macro = true

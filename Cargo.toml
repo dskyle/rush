@@ -2,6 +2,8 @@
 name = "rush"
 version = "0.1.0"
 authors = ["David Kyle <david.kyle@gmail.com>"]
+license = "MIT"
+description = "rush shell, inspired by Rust itself"
 
 [build-dependencies]
 
@@ -19,12 +21,12 @@ glob = "0.2"
 
 [dependencies.rush_pat]
 path = "rush_pat"
-version = "*"
+version = "0.1.0"
 
 [dependencies.rush_parser]
 path = "rush_parser"
-version = "*"
+version = "0.1.0"
 
 [dependencies.rush_rt]
 path = "rush_rt"
-version = "*"
+version = "0.1.0"

@@ -2,20 +2,22 @@
 name = "rush_rt"
 version = "0.1.0"
 authors = ["David Kyle <david.kyle@gmail.com>"]
+license = "MIT"
+description = "run-time types for rush shell"
 
 [dependencies]
 lazy_static = "0.2.2"
-regex = "*"
-num-traits = "*"
+regex = "0.2.2"
+num-traits = "0.1.14"
 
 [dependencies.into_val_derive]
 path = "../into_val_derive"
-version = "*"
+version = "0.1.0"
 
 [dependencies.rush_pat]
 path = "../rush_pat"
-version = "*"
+version = "0.1.0"
 
 [dependencies.rush_parser]
 path = "../rush_parser"
-version = "*"
+version = "0.1.0"

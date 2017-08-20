@@ -2,16 +2,15 @@
 name = "rush_parser"
 version = "0.1.0"
 authors = ["David Kyle <david.kyle@gmail.com>"]
+license = "MIT"
+description = "lexer/parser for rush shell"
 
 [dependencies]
 regex = "0.2"
 lazy_static = "0.2.2"
-odds = "*"
+odds = "0.2.25"
+plex = "0.0.3"
 
 [dependencies.rush_pat]
 path = "../rush_pat"
-version = "*"
-
-[dependencies.plex]
-path = "../../plex"
 version = "*"
