@@ -349,13 +349,24 @@ impl Interp {
                 }
                 val.0.eval();
                 r.enter_scope();
-                if b.subsumes(&val.0) == Subsumption::Contains {
+                if b.subsumes(&val.0).same_or_contains() {
                     b.do_match_unchecked(val.0.into(), r);
                     return Ok(true);
                 } else {
                     r.exit_scope();
                     if has_else { r.enter_scope(); }
-                    return Err(val);
+                    return Ok(false);
+                }
+            },
+            ExprS(Expr::Recv(ref p), _span) => {
+                r.enter_scope();
+                let (val, con) = self.do_recv(p, r, true);
+                if val.is_true() {
+                    return Ok(true);
+                } else {
+                    r.exit_scope();
+                    if has_else { r.enter_scope(); }
+                    return Err((val, con));
                 }
             },
             ref e => {
@@ -465,75 +476,109 @@ impl Interp {
     }
 
     fn do_match(&self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
-        let val = self.from_expr(e, r);
+        let (mut val, mut con) = self.from_expr(e, r);
+        if con.stops_exec() {
+            return (val, con)
+        }
+        for &(ref pat, ref body) in cases {
+            if pat.subsumes(&val).same_or_contains() {
+                r.enter_scope();
+                pat.do_match_unchecked(val.into(), r);
+                let ret = self.exec_stmt(body, r);
+                r.exit_scope();
+                return ret;
+            }
+        }
+        (val, con)
+    }
+
+    fn do_match_all(&self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
+        let (val, mut con) = self.from_expr(e, r);
+        if con.stops_exec() {
+            return (val, con)
+        }
+        let mut ret = vec![];
+        for &(ref pat, ref body) in cases {
+            if pat.subsumes(&val).same_or_contains() {
+                r.enter_scope();
+                pat.do_match_unchecked((&val).into(), r);
+                let (val, con) = self.exec_stmt(body, r);
+                r.exit_scope();
+                if con.stops_exec() {
+                    return (val, con)
+                }
+                ret.push(val);
+            }
+        }
+        (Val::Tup(ret), con)
+    }
+
+    fn do_for(&self, r: &mut LocalVars, pat: &Pat, val: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
+        let mut res = (Val::void(), Control::Done);
+        let ispan = val.1;
+        let val = self.from_expr(val, r);
         if val.1.stops_exec() {
             return val
         }
-        for &(ref pat, ref body) in cases {
-            if pat.subsumes(&val.0) == Subsumption::Contains {
+
+        println!("{:?}", val);
+
+        Cow::from(val.0).for_each_shallow(&mut |val: Cow<Val>| {
+            if pat.subsumes(&*val) == Subsumption::Contains {
                 r.enter_scope();
-                pat.do_match_unchecked(val.0.into(), r);
-                let res = self.exec_stmt(body, r);
+                pat.do_match_unchecked(val, r);
+                res = self.exec_stmt_list(body, r);
                 r.exit_scope();
-                return res;
+                if res.1.breaks_loops() {
+                    res.1.clear_breaks();
+                    return false
+                }
             }
-        }
-        (val.0, Control::Done)
+            return true;
+        });
+
+        res
     }
 
-    fn do_for(&self, r: &mut LocalVars, pat: &Pat, iter: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
+    pub fn call_iter(&self, r: &mut LocalVars, val: Val, ispan: Span) -> Val {
+        let call_iterate = Val::Tup(vec![Val::str("iter"), val]);
+        self.try_call(call_iterate, ispan, r)
+            .unwrap_or_else(|v| Val::err(RuntimeError::InvalidIter(Box::new(v)), Some(ispan)))
+    }
+
+    pub fn call_next(&self, r: &mut LocalVars, val: Val, ispan: Span) -> Val {
+        let call_iterate = Val::Tup(vec![Val::str("next"), val]);
+        self.try_call(call_iterate, ispan, r)
+            .unwrap_or_else(|v| Val::err(RuntimeError::InvalidNext(Box::new(v)), Some(ispan)))
+    }
+
+    fn do_for_iter(&self, r: &mut LocalVars, pat: &Pat, iter: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
         let mut res = (Val::void(), Control::Done);
         let ispan = iter.1;
         let val = self.from_expr(iter, r);
         if val.1.stops_exec() {
             return val
         }
-        let call_iterate = Val::Tup(vec![Val::str("iter"), val.0]);
-        match self.try_call(call_iterate, ispan, r) {
-            Ok(val) => {
-                let mut cur = val;
-                loop {
-                    {
-                        let v = cur.get_tup().unwrap();
-                        if v.len() < 2 { break; }
-                        if pat.subsumes(&v[1]) == Subsumption::Contains {
-                            r.enter_scope();
-                            pat.do_match_unchecked((&v[1]).into(), r);
-                            res = self.exec_stmt_list(body, r);
-                            r.exit_scope();
-                            if res.1.breaks_loops() {
-                                res.1.clear_breaks();
-                                break
-                            }
-                        }
-                    }
-                    let call_next = Val::Tup(vec![Val::str("next"), cur]);
-                    match self.try_call(call_next, ispan, r) {
-                        Ok(val) => {
-                            cur = val;
-                        },
-                        Err(_) => break,
+        let mut cur = self.call_iter(r, val.0, ispan);
+        loop {
+            {
+                if cur.is_err() { return (cur, Control::Done) }
+                if cur.len() < 2 { break; }
+                let v = cur.get_tup().unwrap();
+                if pat.subsumes(&v[1]) == Subsumption::Contains {
+                    r.enter_scope();
+                    pat.do_match_unchecked((&v[1]).into(), r);
+                    res = self.exec_stmt_list(body, r);
+                    r.exit_scope();
+                    if res.1.breaks_loops() {
+                        res.1.clear_breaks();
+                        break
                     }
                 }
-            },
-            Err(val) => {
-                let val : Val = val.take_tup().unwrap().into_iter().nth(1).unwrap();
-                Cow::from(val).for_each_shallow(&mut |val: Cow<Val>| {
-                    if pat.subsumes(&*val) == Subsumption::Contains {
-                        r.enter_scope();
-                        pat.do_match_unchecked(val, r);
-                        res = self.exec_stmt_list(body, r);
-                        r.exit_scope();
-                        if res.1.breaks_loops() {
-                            res.1.clear_breaks();
-                            return false
-                        }
-                    }
-                    return true;
-                });
-            },
-        };
-
+            }
+            cur = self.call_next(r, cur, ispan);
+            if cur.is_void() { break }
+        }
         res
     }
 
@@ -647,10 +692,40 @@ impl Interp {
             Lambda(ref c, ref p, ref b) => self.do_lambda(r, c, p, b),
             Var(m, ref n) => (self.get_var_ref(m, n, r), Control::Done),
             Exec(m, ref n, _) => self.get_exec(m, n, r),
+            ExecList(m, ref n, _) => self.get_exec_list(m, n, r),
             Call(m, ref n, _) => self.do_call(m, n, r),
-            Expr::Range(ref r) => match ::rush_parser::ast::ASTRange::from_ast_range(r.into()) {
-                Ok(r) => (r.as_val(), Control::Done),
-                Err(x) => (Val::err(RuntimeError::ParseError(x), Some(e.1)), Control::Done),
+            Expr::Range(ref rng) => {
+                use rush_parser::ast::ASTRange;
+                use rush_parser::ast::ASTRange::*;
+                fn eval_expr(i: &Interp, e: &ExprS, l: &mut LocalVars) -> Result<ExprS, (Val, Control)> {
+                    if let Some(_) = e.0.get_atom() {
+                        return Ok(e.clone());
+                    }
+                    let (val, con) = i.from_expr(e, l);
+                    if con.stops_exec() {
+                        return Err((val, con));
+                    }
+                    Ok(ExprS(Expr::String(val.get_string().expect("Sides of range must be scalar")), e.1))
+                }
+                let rng = match *rng {
+                    All => Ok(All),
+                    From(ref x) => eval_expr(self, &**x, r).map(|x| From(Box::new(x))),
+                    Till(ref x) => eval_expr(self, &**x, r).map(|x| Till(Box::new(x))),
+                    Within(ref x, ref y) => {
+                        let x = eval_expr(self, &**x, r);
+                        match x {
+                            Ok(x) => eval_expr(self, &**y, r).map(|y| Within(Box::new(x), Box::new(y))),
+                            Err(err) => Err(err),
+                        }
+                    },
+                };
+                match rng {
+                    Ok(r) => match ASTRange::into_range(r.into()) {
+                        Ok(r) => (r.as_val(), Control::Done),
+                        Err(x) => (Val::err(RuntimeError::ParseError(x), Some(e.1)), Control::Done),
+                    },
+                    Err(x) => x,
+                }
             },
             Expr::Rex(ref r) => {
                 ((&r.0).into(), Control::Done)
@@ -658,8 +733,11 @@ impl Interp {
             If{ref cond, ref then, ref el} => self.do_if(r, cond, then, el),
             While{ref cond, ref lo} => self.do_while(r, cond, lo),
             Match{ref val, ref cases} => self.do_match(r, val, cases),
-            For{ref pat, ref iter, ref lo} => self.do_for(r, pat, iter, lo),
+            MatchAll{ref val, ref cases} => self.do_match_all(r, val, cases),
+            For{ref pat, ref val, ref lo} => self.do_for(r, pat, val, lo),
+            ForIter{ref pat, ref iter, ref lo} => self.do_for_iter(r, pat, iter, lo),
             Read(ref ids) => self.do_read(ids, r),
+            Recv(ref pat) => self.do_recv(pat, r, false),
             _ => unimplemented!(),
         }
     }
@@ -677,11 +755,7 @@ impl Interp {
                 return (Self::get_var_ref_id(m, s, n.1, l), con);
             }
         })*/
-            match m {
-                SubsMode::Insert => (val, con),
-                SubsMode::Embed => (Val::Embed(Box::new(val)), con),
-                _ => unimplemented!(),
-            }
+        (val.subst(m), con)
     }
 
     fn get_exec(&self, _: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
@@ -711,12 +785,28 @@ impl Interp {
         (Val::str(buf), Control::Done)
     }
 
+    fn get_exec_list(&self, m: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
+        let (val, con) = self.get_exec(m, n, l);
+        if con.stops_exec() {
+            return (val, con);
+        }
+        if let Val::Str(str) = val {
+            let mut ret = vec![];
+            for line in str.lines() {
+                ret.push(Val::Tup(line.split_whitespace().map(|x| Val::str(x)).collect()))
+            }
+            (Val::Tup(ret).subst(m), Control::Done)
+        } else {
+            (Val::void(), Control::Done)
+        }
+    }
+
     fn get_var_ref(&self, m: SubsMode, n: &ExprS, r: &mut LocalVars) -> Val {
         use self::Expr::*;
         match n.0 {
             Ident(ref id) => self.get_var_ref_id(m, id, n.1, r),
             Var(_, ref e) => {
-                let var = self.get_var_ref(SubsMode::Insert, e, r);
+                let var = self.get_var_ref(SubsMode::new(), e, r);
                 var.with_val(|val| {
                     match *val {
                         Val::Str(ref s) => self.get_var_ref_id(m, s, n.1, r),
@@ -735,11 +825,7 @@ impl Interp {
             None => return Val::err(RuntimeError::UnboundVariable(id.into()), Some(span)),
         };
         //println!("var: {:?}", r);
-        match m {
-            SubsMode::Insert => r,
-            SubsMode::Embed => Val::Embed(Box::new(r)),
-            _ => unimplemented!(),
-        }
+        r.subst(m)
     }
 
     pub fn try_call(&self, val: Val, span: Span, l: &mut LocalVars) -> Result<Val, Val> {
@@ -899,8 +985,9 @@ impl Interp {
                 let (val, _) = self.from_expr(expr, local_vars);
                 (val, Control::Continue)
             },
-            Expr::Tuple(..) | Expr::Ident(..) | Expr::String(..) | Expr::XString(..) |
-                Expr::LString(..) | Expr::Exec(..) | Expr::Call(..) | Expr::Var(..) | Expr::Lambda(..) => {
+            Expr::Tuple(..) | Expr::Ident(..) | Expr::String(..) | Expr::XString(..) | Expr::Range(..) |
+                Expr::LString(..) | Expr::Exec(..) | Expr::ExecList(..) | Expr::Call(..) | Expr::Var(..) | Expr::Lambda(..) |
+                Expr::Index(..) | Expr::Rex(..) => {
                 let (val, con) = self.from_expr(stmt_s, local_vars);
                 //println!("Will call {:?} => {:?}", stmt, val);
                 if con.stops_exec() {
@@ -911,7 +998,8 @@ impl Interp {
                 }
             },
             Expr::Nop => { (Val::void(), Control::Done) },
-            Expr::If{..} | Expr::While{..} | Expr::Match{..} | Expr::For{..} | Expr::Block(..) | Expr::Read(..) => {
+            Expr::If{..} | Expr::While{..} | Expr::Match{..} | Expr::MatchAll{..} | Expr::For{..} | Expr::ForIter{..} |
+                Expr::Block(..) | Expr::Read(..) | Expr::Recv(..) => {
                 self.from_expr(stmt_s, local_vars)
             },
             Expr::Background(ref expr) => {
@@ -926,7 +1014,6 @@ impl Interp {
             Expr::Or(ref lhs, ref rhs) => {
                 self.do_and_or(&*lhs, &*rhs, true, local_vars)
             },
-            Expr::Index(..) | Expr::Range(..) | Expr::Rex(..) => unreachable!(),
             Expr::Manip(..) => unimplemented!(),
         }
     }
@@ -992,6 +1079,36 @@ impl Interp {
                     }
                     do_bind(ids.last().unwrap(), remainder.trim_right());
                     (Val::true_(), Control::Done)
+                },
+                Err(err) => {
+                    (Val::err_string(format!("{:?}", err)), Control::Done)
+                },
+            },
+            None => (Val::false_(), Control::Done),
+        };
+        return ret;
+    }
+
+    fn do_recv(&self, pat: &Pat, local_vars: &mut LocalVars, exact: bool) -> (Val, Control) {
+        use std::io::{self, BufRead};
+
+        let stdin = io::stdin();
+        let ret = match stdin.lock().lines().next() {
+            Some(line) => match line {
+                Ok(line) => {
+                    use builtins::mkval_str;
+                    let val = mkval_str(self, local_vars, &line);
+                    if exact {
+                        if pat.subsumes(&val) == Subsumption::Contains {
+                            pat.do_match_unchecked(val.into(), local_vars);
+                            (Val::true_(), Control::Done)
+                        } else {
+                            (Val::false_(), Control::Done)
+                        }
+                    } else {
+                        pat.do_match_unchecked(val.into(), local_vars);
+                        (Val::true_(), Control::Done)
+                    }
                 },
                 Err(err) => {
                     (Val::err_string(format!("{:?}", err)), Control::Done)

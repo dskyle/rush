@@ -14,6 +14,8 @@ pub enum RuntimeError {
     KeyNotFound{keys: Vec<String>, idx: String},
     UnboundVariable(String),
     InvalidIdentifier(String),
+    InvalidIter(Box<Val>),
+    InvalidNext(Box<Val>),
     CustomError(Vec<Val>),
 }
 

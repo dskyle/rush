@@ -19,6 +19,10 @@ nix = "0.7.0"
 tempfile = "2.1.6"
 glob = "0.2"
 
+[dependencies.linefeed]
+path = "../linefeed"
+version = "*"
+
 [dependencies.rush_pat]
 path = "rush_pat"
 version = "0.1.0"

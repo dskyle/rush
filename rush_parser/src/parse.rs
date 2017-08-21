@@ -78,13 +78,13 @@ parser! {
     stmt: Res<ExprS> {
         stmt2[s] ws => s,
         let_rule[i] => i,
-        set_rule[i] => i,
         func[f] => f,
         control_flow[c] => c,
         => Ok(ExprS(Expr::Nop, Span::new(Pos::new(1,1), Pos::new(1,1)))),
     }
 
     stmt2: Res<ExprS> {
+        set_rule[i] => i,
         stmt3[s] ws => s,
         stmt3[s] ws Amp => Ok(ExprS(Expr::Background(Box::new(s?)), span!())),
     }
@@ -127,11 +127,12 @@ parser! {
     }
 
     expr: Res<ExprS> {
-        expr2[e] => e,
+        subexpr[e] => e,
         and_or_ops[ao] => ao,
+        block_expr[b] ws => b,
     }
 
-    expr2: Res<ExprS> {
+    subexpr: Res<ExprS> {
         //expr3[e] => e,
         ws_tuple_val[tup] => tup,
         comma_tuple_val[tup] => tup,
@@ -145,6 +146,8 @@ parser! {
     }*/
 
     ws_tuple_val: Res<ExprS> {
+        #[no_reduce(Range, Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare,
+                    Read, Recv, If, While, For, Match, MatchAll, LBracePipe, LambdaOpen)]
         ws_tuple[tup] => {
             let mut tup = tup?;
             if tup.len() == 1 {
@@ -166,23 +169,25 @@ parser! {
             Ok(ExprS(Expr::Tuple(TupleStyle::Comma, vec![]), span!())),
     }
 
-    subexpr: Res<ExprS> {
+    subexpr2: Res<ExprS> {
         if_rule[i] => i,
         while_rule[w] => w,
         for_rule[f] => f,
         read_rule[r] => r,
+        recv_rule[r] => r,
         match_rule[m] => m,
         named_tuple[t] ws => t,
-        parens[p] ws => p,
-        block_expr[b] ws => b,
         lambda_val[b] ws => b,
+        range[r] ws => r,
+
+        #[no_reduce(Range)]
         val[v] ws => v,
     }
 
     val: Res<ExprS> {
         var_ref[vr] ws => vr,
         exec[ex] ws => ex,
-        range[r] ws => r,
+        parens[p] ws => p,
     }
 
     ws: () {
@@ -228,14 +233,21 @@ parser! {
         #[no_reduce(Range)]
         atom[a] ws => a,
 
-        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex)]
+        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LBracePipe, LambdaOpen)]
         Range ws => Ok(ExprS(Expr::Range(ASTRange::All), span!())),
 
-        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex)]
+        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LBracePipe, LambdaOpen)]
         atom[a] ws Range ws => Ok(ExprS(Expr::Range(ASTRange::From(Box::new(a?))), span!())),
 
+        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LBracePipe, LambdaOpen)]
+        val[a] ws Range ws => Ok(ExprS(Expr::Range(ASTRange::From(Box::new(a?))), span!())),
+
         Range ws atom[a] ws => Ok(ExprS(Expr::Range(ASTRange::Till(Box::new(a?))), span!())),
+        Range ws val[a] ws => Ok(ExprS(Expr::Range(ASTRange::Till(Box::new(a?))), span!())),
         atom[a] ws Range ws atom[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
+        val[a] ws Range ws val[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
+        atom[a] ws Range ws val[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
+        val[a] ws Range ws atom[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
     }
 
     atom: Res<ExprS> {
@@ -248,19 +260,23 @@ parser! {
     }
 
     ws_tuple: Res<Vec<ExprS>> {
-        subexpr[a] ws => Ok(vec![a?]),
+        #[no_reduce(Comma)]
+        subexpr2[a] ws => Ok(vec![a?]),
 
-        ws_tuple[tup] subexpr[a] => {
+        ws_tuple[tup] subexpr2[a] => {
             let mut tup = tup?; tup.push(a?); Ok(tup)
         },
     }
 
     comma_tuple: Res<Vec<ExprS>> {
-        subexpr[a] ws Comma ws => Ok(vec![a?]),
+        #[no_reduce(Range, Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen,
+                    ExecLSquare, Read, Recv, If, While, For, Match, MatchAll, LBracePipe, LambdaOpen)]
+        subexpr2[a] ws Comma ws => Ok(vec![a?]),
 
-        subexpr[a] ws Comma ws subexpr[b] ws => Ok(vec![a?, b?]),
+        #[no_reduce(Comma)]
+        subexpr2[a] ws Comma ws subexpr2[b] ws => Ok(vec![a?, b?]),
 
-        subexpr[a] ws Comma ws comma_tuple[tup] => {
+        subexpr2[a] ws Comma ws comma_tuple[tup] => {
             let tup = tup?; let mut v = vec![a?]; v.extend(tup); Ok(v)
         },
     }
@@ -340,6 +356,10 @@ parser! {
         ExecLParen(s) nl stmt2[n] nl RParen =>
             Ok(ExprS::exec(parse_exec_subs_mode(s.trim_right_matches('('), span!())?,
                         n?, span!())),
+
+        ExecLSquare(s) nl stmt2[n] nl RSquare =>
+            Ok(ExprS::exec_to_list(parse_exec_subs_mode(s.trim_right_matches('['), span!())?,
+                        n?, span!())),
     }
 
     block: Res<Vec<ExprS>> {
@@ -371,6 +391,13 @@ parser! {
                         }
                         return Err(InvalidCapture(ExprS(Expr::Block(v), s)))
                     },
+                    ExprS(Expr::Set(SetOp::Assign, b, e), _) => {
+                        if let ExprS(Expr::Ident(i), _) = *b {
+                            ret.push((i, Some(*e)));
+                            continue
+                        }
+                        return Err(InvalidCaptureTarget(*b))
+                    },
                     _ => return Err(InvalidCaptureTarget(x)),
                 }
             }
@@ -378,22 +405,21 @@ parser! {
         }
     }
 
+    lambda_body: Res<Vec<ExprS>> {
+        LBrace nl stmt_list[e] nl RBrace => e,
+        subexpr[e] => Ok(vec![e?]),
+    }
+
     lambda: Res<(Vec<(String, Option<ExprS>)>, Pat, RefCell<Option<Vec<ExprS>>>)> {
-        LBrace nl Or nl stmt_list[e] nl RBrace =>
+        LambdaOpen nl Pipe ws lambda_body[e] =>
             Ok((vec![], ExprS::lambda_to_pat(vec![], ExprS(Expr::Tuple(TupleStyle::Comma, vec![]), span!()))?, RefCell::new(Some(e?)))),
-        LBrace nl Pipe nl Pipe nl stmt_list[e] nl RBrace =>
-            Ok((vec![], ExprS::lambda_to_pat(vec![], ExprS(Expr::Tuple(TupleStyle::Comma, vec![]), span!()))?, RefCell::new(Some(e?)))),
-        LBrace nl Pipe nl expr[a] nl Pipe nl stmt_list[e] nl RBrace =>
+        LambdaOpen nl expr[a] nl Pipe ws lambda_body[e] =>
             Ok((vec![], ExprS::lambda_to_pat(vec![], a?)?, RefCell::new(Some(e?)))),
-        LBrace nl capture[c] ws Or nl stmt_list[e] nl RBrace => {
+        LambdaOpen nl Pipe nl capture[c] ws lambda_body[e] => {
             let c = c?; let binds = c.iter().map(|x| x.0.clone()).collect();
             Ok((c, ExprS::lambda_to_pat(binds, ExprS(Expr::Tuple(TupleStyle::Comma, vec![]), span!()))?, RefCell::new(Some(e?))))
         },
-        LBrace nl capture[c] ws Pipe nl Pipe nl stmt_list[e] nl RBrace => {
-            let c = c?; let binds = c.iter().map(|x| x.0.clone()).collect();
-            Ok((c, ExprS::lambda_to_pat(binds, ExprS(Expr::Tuple(TupleStyle::Comma, vec![]), span!()))?, RefCell::new(Some(e?))))
-        },
-        LBrace nl capture[c] ws Pipe nl expr[a] nl Pipe nl stmt_list[e] nl RBrace => {
+        LambdaOpen nl expr[a] nl Pipe nl capture[c] ws lambda_body[e] => {
             let c = c?; let binds = c.iter().map(|x| x.0.clone()).collect();
             Ok((c, ExprS::lambda_to_pat(binds, a?)?, RefCell::new(Some(e?))))
         },
@@ -431,7 +457,17 @@ parser! {
     for_rule: Res<ExprS> {
         For ws expr[bind] nl Colon nl subexpr[iter] nl block[lo] ws => {
             let pat = ExprS::to_pat(bind?)?;
-            Ok(ExprS(Expr::For{pat: pat, iter: Box::new(iter?), lo: lo?}, span!()))
+            let iter = iter?;
+            if let ExprS(Expr::Range(..), ..) = iter {
+                Ok(ExprS(Expr::ForIter{pat: pat, iter: Box::new(iter), lo: lo?}, span!()))
+            } else {
+                Ok(ExprS(Expr::For{pat: pat, val: Box::new(iter), lo: lo?}, span!()))
+            }
+        },
+
+        For ws expr[bind] nl Colon nl Iter nl subexpr[iter] nl block[lo] ws => {
+            let pat = ExprS::to_pat(bind?)?;
+            Ok(ExprS(Expr::ForIter{pat: pat, iter: Box::new(iter?), lo: lo?}, span!()))
         },
     }
 
@@ -466,6 +502,16 @@ parser! {
         #[no_reduce(Ident)]
         Read ws id_list[i] ws => {
             Ok(ExprS(Expr::Read(i?), span!()))
+        },
+
+        Read ws LParen ws id_list[i] ws RParen ws => {
+            Ok(ExprS(Expr::Read(i?), span!()))
+        },
+    }
+
+    recv_rule: Res<ExprS> {
+        Recv ws subexpr[p] ws => {
+            Ok(ExprS(Expr::Recv(ExprS::to_pat(p?)?), span!()))
         },
     }
 
@@ -504,16 +550,16 @@ parser! {
     }
 
     and_or_ops: Res<ExprS> {
-        expr2[l] And nl expr2[r] ws =>
+        subexpr[l] And nl subexpr[r] ws =>
             Ok(make_and_or_val(Expr::And, l?, r?, span!())),
 
-        expr2[l] Or nl expr2[r] ws =>
+        subexpr[l] Or nl subexpr[r] ws =>
             Ok(make_and_or_val(Expr::Or, l?, r?, span!())),
 
-        and_or_ops[l] And nl expr2[r] ws =>
+        and_or_ops[l] And nl subexpr[r] ws =>
             Ok(make_and_or_val(Expr::And, l?, r?, span!())),
 
-        and_or_ops[l] Or nl expr2[r] ws =>
+        and_or_ops[l] Or nl subexpr[r] ws =>
             Ok(make_and_or_val(Expr::Or, l?, r?, span!())),
     }
 
@@ -525,7 +571,7 @@ parser! {
     }
 
     match_one: Res<(Pat, ExprS)> {
-        expr[e] ws Into ws subexpr[b] ws => {
+        expr[e] ws Into ws stmt3[b] ws => {
             Ok((ExprS::to_pat(e?)?, b?))
         }
         //expr[e] ws Into ws block[b] ws => {
@@ -546,6 +592,9 @@ parser! {
     match_rule: Res<ExprS> {
         Match nl subexpr[i] nl match_block[n] ws =>
             Ok(ExprS(Expr::Match{val: Box::new(i?), cases: n?}, span!())),
+
+        MatchAll nl subexpr[i] nl match_block[n] ws =>
+            Ok(ExprS(Expr::MatchAll{val: Box::new(i?), cases: n?}, span!())),
     }
 
     control_flow: Res<ExprS> {
@@ -593,21 +642,22 @@ fn parse_exec_subs_mode(s: &str, span: Span) -> Res<SubsMode> {
 
 fn parse_subs_mode(s: &str, span: Span) -> Res<SubsMode> {
     let s = s.trim_left_matches('$');
-    if let Some(c) = s.chars().next() {
+    let mut ret = SubsMode::new();
+    for c in s.chars() {
         match c {
-            ',' => Ok(SubsMode::Embed),
-            _ => Err(InvalidSubsMode(span, s.into())),
+            ',' => ret.embed = true,
+            '-' => ret.flatten = true,
+            _ => return Err(InvalidSubsMode(span, s.into())),
         }
-    } else {
-        Ok(SubsMode::Insert)
     }
+    return Ok(ret)
 }
 
 fn make_index_call(idx: ExprS, span: Span, s: &str) -> Res<ExprS> {
     if let ExprS(Expr::Index((n, ns), i), _) = idx {
         Ok(ExprS::call(parse_subs_mode(s, span)?, ExprS::tuple(TupleStyle::Named, vec![
                 ExprS::ident("op::index".into(), span),
-                ExprS::var(SubsMode::Insert, ExprS(Expr::Ident(n), ns), span), *i
+                ExprS::var(SubsMode::new(), ExprS(Expr::Ident(n), ns), span), *i
             ], span), span))
     } else { unreachable!() }
 }

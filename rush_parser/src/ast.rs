@@ -11,12 +11,31 @@ use rush_pat::range::{Range};
 use parse::{ParseError, Res};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum SubsMode {
-    Void,
-    Status,
-    Insert,
-    Embed,
-    String,
+pub struct SubsMode {
+    pub embed: bool,
+    pub flatten: bool,
+}
+
+impl SubsMode {
+    pub fn new() -> SubsMode {
+        SubsMode{embed: false, flatten: false}
+    }
+
+    pub fn embed() -> SubsMode {
+        SubsMode{embed: true, flatten: false}
+    }
+
+    pub fn is_embed(&self) -> bool {
+        self.embed
+    }
+
+    pub fn flatten() -> SubsMode {
+        SubsMode{embed: false, flatten: true}
+    }
+
+    pub fn is_flatten(&self) -> bool {
+        self.flatten
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -86,6 +105,10 @@ impl Span {
     pub fn new(l: Pos, r: Pos) -> Span {
         Span{l: l, r: r}
     }
+
+    pub fn zero() -> Span {
+        Self::new(Pos::new(0, 0), Pos::new(0, 0))
+    }
 }
 
 impl AddAssign<usize> for Span {
@@ -128,7 +151,7 @@ pub enum ASTRange {
 }
 
 impl ASTRange {
-    pub fn from_ast_range(r: Cow<ASTRange>) -> Res<Range> {
+    pub fn into_range(r: Cow<ASTRange>) -> Res<Range> {
         use self::Range::*;
         use self::ParseError::*;
 
@@ -199,6 +222,7 @@ pub enum Expr {
     LString(String),
     XString(Vec<ExprS>),
     Exec(SubsMode, Box<ExprS>, Vec<ManOp>),
+    ExecList(SubsMode, Box<ExprS>, Vec<ManOp>),
     Call(SubsMode, Box<ExprS>, Vec<ManOp>),
     Var(SubsMode, Box<ExprS>),
     Block(Vec<ExprS>),
@@ -207,6 +231,7 @@ pub enum Expr {
     Manip(ManOp, Box<ExprS>),
     Let(Pat, Box<ExprS>),
     Read(Vec<ExprS>),
+    Recv(Pat),
     Set(SetOp, Box<ExprS>, Box<ExprS>),
     Import(ImportScope, Box<ExprS>, Option<Box<ExprS>>, Option<(SetOp, Box<ExprS>)>),
     And(Box<ExprS>, Box<ExprS>),
@@ -215,8 +240,10 @@ pub enum Expr {
     Background(Box<ExprS>),
     If{cond: Box<ExprS>, then: Vec<ExprS>, el: Option<Vec<ExprS>>},
     While{cond: Box<ExprS>, lo: Vec<ExprS>},
-    For{pat: Pat, iter: Box<ExprS>, lo: Vec<ExprS>},
+    For{pat: Pat, val: Box<ExprS>, lo: Vec<ExprS>},
+    ForIter{pat: Pat, iter: Box<ExprS>, lo: Vec<ExprS>},
     Match{val: Box<ExprS>, cases: Vec<(Pat, ExprS)>},
+    MatchAll{val: Box<ExprS>, cases: Vec<(Pat, ExprS)>},
     Index((String, Span), Box<ExprS>),
     Range(ASTRange),
     Break(Option<Box<ExprS>>),
@@ -253,6 +280,10 @@ impl ExprS {
 
     pub fn exec(m: SubsMode, e: ExprS, sp: Span) -> ExprS {
         ExprS(Expr::Exec(m, Box::new(e), vec![]), sp)
+    }
+
+    pub fn exec_to_list(m: SubsMode, e: ExprS, sp: Span) -> ExprS {
+        ExprS(Expr::ExecList(m, Box::new(e), vec![]), sp)
     }
 
     pub fn call(m: SubsMode, e: ExprS, sp: Span) -> ExprS {
@@ -337,7 +368,7 @@ impl ExprS {
             Ident(s) => Ok(ID(s)),
             String(s) | LString(s) => Ok(Str(s)),
             Range(self::ASTRange::All) => Ok(Wild(vec![])),
-            Range(r) => Ok(Rng(ASTRange::from_ast_range(Cow::from(r))?)),
+            Range(r) => Ok(Rng(ASTRange::into_range(Cow::from(r))?)),
             Block(v) => {
                 if let Some(v) = require_string_list(&v) {
                     Ok(StrList(v))
@@ -345,6 +376,21 @@ impl ExprS {
                     Ok(Bind(bind.into(), Box::new(Self::to_pat(expr)?)))
                 } else {
                     Err(InvalidPattern(ExprS(Nop, span), "{...} in pattern must contain a scalar list or an assignment"))
+                }
+            },
+            Set(SetOp::Assign, lhs, rhs) => {
+                let lspan = lhs.1;
+                let lexpr = lhs.0;
+                match lexpr.take_ident() {
+                    Ok(id) => Ok(Bind(id.into(), Box::new(Self::to_pat(*rhs)?))),
+                    Err(e) => Err(InvalidPattern(ExprS(e, lspan), "Invalid as lhs of assignment pattern")),
+                }
+            },
+            Pipe(v, None) => {
+                if let Some(v) = require_string_pipe_list(&v) {
+                    Ok(StrList(v))
+                } else {
+                    Err(InvalidPattern(ExprS(Pipe(v, None), span), "Invalid as pattern; pipes must separate literal strings"))
                 }
             },
             Expr::Rex(r) => Ok(Pat::Rex(r)),
@@ -377,7 +423,7 @@ impl ExprS {
     pub fn is_callable(&self) -> bool {
         use self::Expr::*;
         match self.0 {
-            Tuple(..) | Ident(..) | String(..) | LString(..) | XString(..) | Exec(..) | Call(..) | Var(..) | Lambda(..) => {
+            Tuple(..) | Ident(..) | String(..) | LString(..) | XString(..) | Exec(..) | ExecList(..) | Call(..) | Var(..) | Lambda(..) => {
                 true
             },
             _ => false
@@ -400,11 +446,20 @@ fn require_string_list(v: &Vec<ExprS>) -> Option<Vec<String>> {
     }
 }
 
+fn require_string_pipe_list(v: &Vec<ExprS>) -> Option<Vec<String>> {
+    let ret: Vec<Option<String>> = v.iter().map(|v| v.get_atom()).collect();
+    if ret.iter().any(|v| v.is_none()) {
+        return None
+    } else {
+        return Some(ret.into_iter().map(|v| v.unwrap()).collect())
+    }
+}
+
 fn require_binding(mut v: Vec<ExprS>) -> Option<(String, ExprS)> {
     if v.len() != 1 { return None }
     let s: ExprS = v.drain(..).nth(0).unwrap();
     if let ExprS(Expr::Set(SetOp::Assign, lhs, rhs), _) = s {
-        if let Some(id) = lhs.0.take_ident() {
+        if let Ok(id) = lhs.0.take_ident() {
             return Some((id, *rhs))
         } else {
             return None
@@ -430,11 +485,11 @@ impl Expr {
         }
     }
 
-    pub fn take_ident(self) -> Option<String> {
+    pub fn take_ident(self) -> Result<String, Expr> {
         if let Expr::Ident(i) = self {
-            Some(i)
+            Ok(i)
         } else {
-            None
+            Err(self)
         }
     }
 
@@ -513,6 +568,16 @@ impl Expr {
             None
         }
     }
+
+    pub fn is_value(&self) -> bool {
+        use self::Expr::*;
+
+        match *self {
+            Ident(..) | String(..) | LString(..) => true,
+            Tuple(_, ref v) | Block(ref v) => v.iter().all(|x| x.is_value()),
+            _ =>false,
+        }
+    }
 }
 
 impl fmt::Debug for Expr {
@@ -525,11 +590,14 @@ impl fmt::Debug for Expr {
             &LString(ref s) => write!(f, "\'{}\'", s),
             &XString(ref s) => write!(f, "\"XString{:?}\"", s),
             &Exec(ref m, ref s, _) => write!(f, "Exec<{:#?}>{{{:#?}}}", m, s),
+            &ExecList(ref m, ref s, _) => write!(f, "ExecList<{:#?}>{{{:#?}}}", m, s),
             &Call(ref m, ref s, _) => write!(f, "Call<{:#?}>{{{:#?}}}", m, s),
             &If{cond: ref c, then: ref t, el: ref e} => write!(f, "If({:#?}, {:#?}, {:#?})", c, t, e),
             &While{cond: ref c, lo: ref l} => write!(f, "While({:#?}, {:#?})", c, l),
-            &For{pat: ref p, iter: ref i, lo: ref l} => write!(f, "For({:#?} in {:#?}, {:#?})", p, i, l),
+            &For{pat: ref p, val: ref i, lo: ref l} => write!(f, "For({:#?} in {:#?}, {:#?})", p, i, l),
+            &ForIter{pat: ref p, iter: ref i, lo: ref l} => write!(f, "For({:#?} in {:#?}, {:#?})", p, i, l),
             &Match{val: ref v, cases: ref c} => write!(f, "Match({:#?}){:#?}", v, c),
+            &MatchAll{val: ref v, cases: ref c} => write!(f, "MatchAll({:#?}){:#?}", v, c),
             &Var(ref m, ref s) => write!(f, "Var<{:#?}>{{{:#?}}}", m, s),
             &Block(ref r) => {
                 //let Func{args: ref a, body: ref b} = *r.deref();
@@ -542,6 +610,7 @@ impl fmt::Debug for Expr {
             &Pipe(ref p, ref q) => write!(f, "Pipe({:#?}, {:#?})", p, q),
             &Let(ref l, ref r) => write!(f, "Let({:#?} = {:#?})", l, r),
             &Read(ref p) => write!(f, "Read({:#?})", p),
+            &Recv(ref p) => write!(f, "Recv({:#?})", p),
             &Set(o, ref l, ref r) => write!(f, "{:#?}({:#?} = {:#?})", o, l, r),
             &Import(s, ref l, ref r, ref i) => write!(f, "Import({:#?} {:#?} : {:#?} = {:#?})", s, l, r, i),
             &Index(ref n, ref i) => write!(f, "Index({:#?}[{:#?}])", n, i),

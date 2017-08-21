@@ -7,7 +7,7 @@ description = "run-time types for rush shell"
 
 [dependencies]
 lazy_static = "0.2.2"
-regex = "0.2.2"
+regex = "0.2.1"
 num-traits = "0.1.14"
 
 [dependencies.into_val_derive]

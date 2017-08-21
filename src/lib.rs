@@ -63,14 +63,28 @@ pub mod util {
         println!("");
     }
 
-    pub fn repr(val: &Val) {
-        let mut val = val.clone();
-        val.eval();
+    pub fn repr(val: &Val) -> String {
         if val.len() == 1 {
-            println!("{}", val.iter().next().unwrap());
+            val.iter().next().unwrap().repr()
         } else {
-            println!("{}", val);
+            val.repr()
         }
+    }
+
+    pub fn len(val: &Val) -> String {
+        if val.len() == 1 {
+            val.iter().next().unwrap().len()
+        } else {
+            val.len()
+        }.to_string()
+    }
+
+    pub fn count(val: &Val) -> String {
+        if val.len() == 1 {
+            val.iter().next().unwrap().count()
+        } else {
+            val.count()
+        }.to_string()
     }
 
     pub fn debug(val: &Val) {
@@ -327,7 +341,7 @@ pub mod util {
 mod builtins {
     use rush_pat::range::{Range};
     use rush_rt::vars::{LocalVars, Resolver};
-    use rush_rt::val::{Val, ValIterOps};
+    use rush_rt::val::{Val, ValIterOps, InternalIterable};
     use rush_rt::range::RangeExt;
     use interp::{Interp};
     use util;
@@ -344,7 +358,25 @@ mod builtins {
     pub fn repr(_: &Interp, locs: &mut LocalVars) -> Val
     {
         let arg = locs.get("args").unwrap();
-        util::repr(&*arg.get_ref());
+        Val::str(util::repr(&*arg.get_ref()))
+    }
+
+    pub fn len(_: &Interp, locs: &mut LocalVars) -> Val
+    {
+        let arg = locs.get("args").unwrap();
+        Val::str(util::len(&*arg.get_ref()))
+    }
+
+    pub fn count(_: &Interp, locs: &mut LocalVars) -> Val
+    {
+        let arg = locs.get("args").unwrap();
+        Val::str(util::count(&*arg.get_ref()))
+    }
+
+    pub fn erepr(_: &Interp, locs: &mut LocalVars) -> Val
+    {
+        let arg = locs.get("args").unwrap();
+        println!("{}", util::repr(&*arg.get_ref()));
         Val::status(0)
     }
 
@@ -434,6 +466,22 @@ mod builtins {
         v
     }
 
+    pub fn mkval_str(i: &Interp, locs: &mut LocalVars, cmd: &str) -> Val
+    {
+        let mut lex = ::rush_parser::lex::ContextLexer::new();
+        let parsed = ::rush_parser::parse::parse(lex.lex(cmd));
+        match parsed {
+            Ok(ref e) if e.len() == 1 && e[0].0.is_value() => i.from_expr(&e[0], locs).0,
+            _ => Val::void(),
+        }
+    }
+
+    pub fn mkval(i: &Interp, locs: &mut LocalVars, args: Val) -> Val
+    {
+        let cmd = args.iter().flatten().iter().join(" ");
+        return mkval_str(i, locs, cmd.as_ref());
+    }
+
     pub fn source(i: &Interp, locs: &mut LocalVars, args: Val) -> Val
     {
         let contents = util::file2string(args.get_str().expect("source takes one argument: file name"));
@@ -494,6 +542,116 @@ mod builtins {
         let r = locs.get("r").unwrap();
         let val = util::range_iter_next(&*cur.get_ref(), &*l.get_ref(), &*r.get_ref());
         val
+    }
+
+    pub fn readline_iter_start(i: &Interp, locs: &mut LocalVars) -> Val
+    {
+        readline_iter_next(i, locs)
+    }
+
+    pub fn readline_iter_next(_: &Interp, _: &mut LocalVars) -> Val
+    {
+        use std::io::{self, BufRead};
+
+        let stdin = io::stdin();
+        let ret = match stdin.lock().lines().next() {
+            Some(line) => match line {
+                Ok(line) => Val::Tup(vec![Val::str("readline::Iter"), Val::str(line)]),
+                Err(err) => Val::err_string(format!("{:?}", err)),
+            },
+            None => Val::void(),
+        };
+        return ret;
+    }
+
+    pub fn map_iter_start(i: &Interp, locs: &mut LocalVars) -> Val
+    {
+        use rush_parser::ast::Span;
+        let iter = locs.get("iter").unwrap().get();
+        let op = locs.get("op").unwrap().get();
+        if iter.len() < 2|| iter.is_err() { return iter }
+        let val = iter.iter().nth(1).unwrap().clone();
+        let val = i.call(Val::Tup(vec![op.clone(), val.clone()]), Span::zero(), locs);
+        Val::Tup(vec![Val::str("map::Iter"), val, iter, op])
+
+    }
+
+    pub fn map_iter_next(i: &Interp, locs: &mut LocalVars) -> Val
+    {
+        use rush_parser::ast::Span;
+        let iter = locs.get("iter").unwrap().get();
+        let op = locs.get("op").unwrap().get();
+        let iter = i.call_next(locs, iter, Span::zero());
+        if iter.len() < 2 || iter.is_err() { return iter }
+        let val = iter.iter().nth(1).unwrap().clone();
+        let val = i.call(Val::Tup(vec![op.clone(), val.clone()]), Span::zero(), locs);
+        Val::Tup(vec![Val::str("map::Iter"), val, iter, op])
+    }
+
+    pub fn header_iter_start(i: &Interp, locs: &mut LocalVars) -> Val
+    {
+        use rush_parser::ast::Span;
+        let iter = locs.get("iter").unwrap().get();
+        if iter.len() < 2|| iter.is_err() { return iter }
+        let header = iter.iter().nth(1).unwrap().clone();
+        let iter = i.call_next(locs, iter, Span::zero());
+        let val = iter.iter().nth(1).unwrap().clone();
+
+        Val::Tup(vec![Val::str("header::Iter"), header.pair_with(&val), iter, header])
+
+    }
+
+    pub fn header_iter_next(i: &Interp, locs: &mut LocalVars) -> Val
+    {
+        use rush_parser::ast::Span;
+        let iter = locs.get("iter").unwrap().get();
+        let header = locs.get("header").unwrap().get();
+        let iter = i.call_next(locs, iter, Span::zero());
+        if iter.len() < 2|| iter.is_err() { return iter }
+        let val = iter.iter().nth(1).unwrap().clone();
+
+        Val::Tup(vec![Val::str("header::Iter"), header.pair_with(&val), iter, header])
+    }
+
+    pub fn list_iter_start(_: &Interp, _: &mut LocalVars, args: Val) -> Val
+    {
+        let a = match args.len() {
+            0 => Val::void(),
+            1 => {
+                let v = args.take_tup().unwrap();
+                let a = v.into_iter().next().unwrap();
+                a
+            },
+            _ => args,
+        };
+        let mut ret = match a.take_tup() {
+            Ok(mut args) => {
+                args.insert(0, Val::str("list::Iter"));
+                Val::Tup(args)
+            },
+            Err(arg) => Val::Tup(vec![Val::str("list::Iter"), arg])
+        };
+        ret.eval();
+        ret
+    }
+
+    pub fn list_iter_next(_: &Interp, _: &mut LocalVars, args: Val) -> Val
+    {
+        let args = args.take_tup().unwrap().into_iter().next().unwrap();
+        if args.len() <= 2 {
+            Val::void()
+        } else {
+            let mut v = Vec::with_capacity(args.len() - 1);
+            let mut count = 0;
+            Cow::from(args).for_each_shallow(&mut |val: Cow<Val>| {
+                if count != 1 {
+                    v.push(val.into_owned())
+                }
+                count += 1;
+                return true;
+            });
+            Val::Tup(v)
+        }
     }
 
     pub fn cd(_: &Interp, locs: &mut LocalVars) -> Val
@@ -581,9 +739,13 @@ impl Processor {
             let mut fns = interp.funcs.borrow_mut();
             fns.reg(Func::built_in(mk_wild_pat("system"), builtins::system));
             fns.reg(Func::mac("eval", builtins::eval));
+            fns.reg(Func::mac("mkval", builtins::mkval));
             fns.reg(Func::mac("source", builtins::source));
             fns.reg(Func::built_in(mk_wild_pat("echo"), builtins::echo));
             fns.reg(Func::built_in(mk_wild_pat("repr"), builtins::repr));
+            fns.reg(Func::built_in(mk_wild_pat("erepr"), builtins::erepr));
+            fns.reg(Func::built_in(mk_wild_pat("len"), builtins::len));
+            fns.reg(Func::built_in(mk_wild_pat("count"), builtins::count));
             fns.reg(Func::built_in(mk_wild_pat("debug"), builtins::debug));
             fns.reg(Func::built_in(mk_wild_pat("add"), builtins::add));
             fns.reg(Func::built_in(mk_wild_pat("keys"), builtins::keys));
@@ -598,6 +760,18 @@ impl Processor {
 
             fns.reg(Func::built_in(mk_pat!( ("iter", ("Range", {l}, {r})) ), builtins::range_iter_start));
             fns.reg(Func::built_in(mk_pat!( ("next", ("Range::Iter", {cur}, {l}, {r})) ), builtins::range_iter_next));
+
+            fns.reg(Func::built_in(mk_pat!( ("iter", "readline") ), builtins::readline_iter_start));
+            fns.reg(Func::built_in(mk_pat!( ("next", ("readline::Iter", {cur})) ), builtins::readline_iter_next));
+
+            fns.reg(Func::built_in(mk_pat!( ("iter", ("map", {iter}, {op})) ), builtins::map_iter_start));
+            fns.reg(Func::built_in(mk_pat!( ("next", ("map::Iter", {cur}, {iter}, {op})) ), builtins::map_iter_next));
+
+            fns.reg(Func::built_in(mk_pat!( ("iter", ("header", {iter})) ), builtins::header_iter_start));
+            fns.reg(Func::built_in(mk_pat!( ("next", ("header::Iter", {cur}, {iter}, {header})) ), builtins::header_iter_next));
+
+            fns.reg(Func::mac("iter", builtins::list_iter_start));
+            fns.reg(Func::mac("next", builtins::list_iter_next));
 
             fns.reg(Func::built_in(mk_pat!( ("op::bool", ("Status", {s})) ), builtins::op_bool_status));
         }

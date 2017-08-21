@@ -6,7 +6,7 @@ license = "MIT"
 description = "lexer/parser for rush shell"
 
 [dependencies]
-regex = "0.2"
+regex = "0.2.1"
 lazy_static = "0.2.2"
 odds = "0.2.25"
 plex = { git = "https://github.com/goffrie/plex" }

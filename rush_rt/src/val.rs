@@ -1,5 +1,5 @@
 use vars::VarRef;
-use rush_parser::ast::Span;
+use rush_parser::ast::{Span, SubsMode};
 use std::ops::Deref;
 use std::ascii::AsciiExt;
 use std::fmt::{Display, Formatter, Error};
@@ -242,6 +242,19 @@ impl<'a> Iterator for ValIter<'a> {
     }
 }
 
+pub fn escape_rush_char(c: char) -> String {
+    if c == '$' {
+        return "\\$".to_string();
+    } else {
+        return c.escape_default().collect();
+    }
+}
+
+pub fn escape_rush_string(s: &str) -> String {
+    let bytes = s.chars().map(|c| escape_rush_char(c)).flat_map(|i| i.into_bytes()).collect();
+    unsafe { String::from_utf8_unchecked(bytes) }
+}
+
 impl Val {
     pub fn str<S: Into<String>>(s: S) -> Val {
         Val::Str(s.into())
@@ -250,10 +263,57 @@ impl Val {
     pub fn len(&self) -> usize {
         use self::Val::*;
 
-        match self {
-            &Tup(ref v) => v.len(),
-            _ => 1,
-        }
+        self.with_val(|v| {
+            match *v {
+                Tup(ref v) => v.len(),
+                Embed(ref e) => e.len(),
+                _ => 1,
+            }
+        })
+    }
+
+    pub fn count(&self) -> usize {
+        use self::Val::*;
+
+        self.with_val(|v| {
+            match *v {
+                Tup(ref v) => v.iter().map(|x| x.len()).sum(),
+                Embed(ref e) => e.len(),
+                _ => 1,
+            }
+        })
+    }
+
+    pub fn repr(&self) -> String {
+        use self::Val::*;
+
+        self.with_val(|val| {
+            match *val {
+                Str(ref s) => {
+                    if ::rush_parser::lex::is_valid_naked_string(s) {
+                        s.clone()
+                    } else {
+                        "\"".to_string() + &escape_rush_string(s) + "\""
+                    }
+                },
+                Tup(ref v) => {
+                    let mut vals: Vec<String> = Vec::with_capacity(v.len());
+                    Cow::from(val).for_each_shallow(&mut |val: Cow<Val>| {
+                        vals.push(val.repr());
+                        return true;
+                    });
+                    let mut ret = "(".to_string() + &vals.join(", ");
+                    if vals.len() == 1 { ret += "," }
+                    ret += ")";
+                    return ret;
+                }
+                Error(ref e) => {
+                    return "Err!".to_string() + &Tup(e.0.clone()).repr();
+                }
+                Embed(ref e) => e.repr(),
+                Ref(..) => unreachable!(),
+            }
+        })
     }
 
     pub fn with_val<T, F: FnOnce(&Val) -> T>(&self, f: F) -> T {
@@ -353,7 +413,19 @@ impl Val {
                 nv.eval();
                 new_val = Some(nv);
             },
-            &mut Embed(ref mut e) => e.eval(),
+            &mut Embed(ref mut e) => {
+                e.eval();
+                if e.len() == 1 {
+                    match e.get_tup_mut() {
+                        Some(ref mut v) if v.len() == 1 => {
+                            let mut tmp = Val::void();
+                            ::std::mem::swap(&mut tmp, &mut v[0]);
+                            new_val = Some(tmp)
+                        },
+                        _ => {}
+                    }
+                }
+            },
             _ => {},
         }
 
@@ -424,11 +496,11 @@ impl Val {
         }
     }
 
-    pub fn take_tup(self) -> Option<Vec<Val>> {
+    pub fn take_tup(self) -> Result<Vec<Val>, Val> {
         if let Val::Tup(v) = self {
-            Some(v)
+            Ok(v)
         } else {
-            None
+            Err(self)
         }
     }
 
@@ -460,6 +532,14 @@ impl Val {
         Val::Str("1".into())
     }
 
+    pub fn is_true(&self) -> bool {
+        if let Val::Str(ref s) = *self{
+            return s == "1"
+        } else {
+            return false
+        }
+    }
+
     pub fn false_() -> Val {
         Val::Str("0".into())
     }
@@ -475,6 +555,14 @@ impl Val {
                 _ => false,
             }
         })
+    }
+
+    pub fn is_err(&self) -> bool {
+        if let Val::Error(..) = *self {
+            true
+        } else {
+            false
+        }
     }
 
     pub fn err_str(val: &str) -> Val {
@@ -528,6 +616,47 @@ impl Val {
             }
         }
         return false;
+    }
+
+    pub fn flatten(self) -> Val {
+        let mut ret = Vec::with_capacity(self.count());
+        Cow::from(self).for_each(&mut |s: Cow<str>, _| {
+            ret.push(Val::Str(s.into_owned()));
+            true
+        });
+        Val::Tup(ret)
+    }
+
+    pub fn subst(mut self, m: SubsMode) -> Val {
+        if m.is_flatten() {
+            self = self.flatten()
+        }
+        if m.is_embed() {
+            Val::Embed(Box::new(self))
+        } else {
+            self
+        }
+    }
+
+    pub fn pair_with(&self, val: &Val) -> Val {
+        let mut pairs = vec![];
+        let mut li = self.iter().fuse();
+        let mut ri = val.iter().fuse();
+        loop {
+            match (li.next(), ri.next()) {
+                (Some(lv), Some(rv)) => {
+                    pairs.push(Val::Tup(vec![lv.clone(), rv.clone()]));
+                },
+                (Some(lv), None) => {
+                    pairs.push(Val::Tup(vec![lv.clone(), Val::void()]));
+                }
+                (None, Some(rv)) => {
+                    pairs.push(Val::Tup(vec![Val::void(), rv.clone()]));
+                }
+                (None, None) => break,
+            }
+        }
+        Val::Tup(pairs)
     }
 }
 

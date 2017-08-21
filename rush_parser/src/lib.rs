@@ -4,7 +4,6 @@
 #![feature(box_patterns)]
 
 extern crate regex;
-extern crate odds;
 
 #[macro_use]
 extern crate lazy_static;

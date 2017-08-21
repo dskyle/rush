@@ -19,6 +19,8 @@ pub enum Tok {
     Range,
     Colon,
     Pipe,
+    LBracePipe,
+    LambdaOpen,
     Amp,
     Lt,
     Gt,
@@ -31,11 +33,14 @@ pub enum Tok {
     Global,
     Sys,
     Read,
+    Recv,
     If,
     Else,
     While,
     For,
+    Iter,
     Match,
+    MatchAll,
     Return,
     Break,
     Continue,
@@ -49,6 +54,7 @@ pub enum Tok {
     VarLBrace(String),
     Exec(String),
     ExecLParen(String),
+    ExecLSquare(String),
     Redir(u8, u8),
     Rex(String),
     Error(String),
@@ -67,12 +73,15 @@ lexer! {
     r##"global"## => Tok::Global,
     r##"sys"## => Tok::Sys,
     r##"read"## => Tok::Read,
+    r##"recv"## => Tok::Recv,
     r##"if"## => Tok::If,
     r##"else"## => Tok::Else,
     r##"while"## => Tok::While,
     r##"for"## => Tok::For,
+    r##"iter"## => Tok::Iter,
     r##"fn"## => Tok::Func,
     r##"match"## => Tok::Match,
+    r##"match_all"## => Tok::MatchAll,
     r##"break"## => Tok::Break,
     r##"continue"## => Tok::Continue,
     r##"return"## => Tok::Return,
@@ -93,20 +102,24 @@ lexer! {
     r##"\("## => Tok::LParen,
     r##"\)"## => Tok::RParen,
 
+    r##"$\|"## => Tok::LambdaOpen,
+
     r##"\{"## => Tok::LBrace,
+    r##"\{\|"## => Tok::LBracePipe,
     r##"\}"## => Tok::RBrace,
 
     r##"\["## => Tok::LSquare,
     r##"\]"## => Tok::RSquare,
 
-    r##"\$(|,)\{"## => Tok::VarLBrace(text.into()),
+    r##"\$(|,|-|,-|-,)\{"## => Tok::VarLBrace(text.into()),
     r##"\$\("## => Tok::ExecLParen(text.into()),
+    r##"\$(|,|-|,-|-,)\["## => Tok::ExecLSquare(text.into()),
 
     r##"\$(|,)"## => Tok::Var(text.into()),
 
     r##"'([^'])*'"## => Tok::SingleString(text.trim_matches('\'').into()),
     r##""([^\\"]|\\"|\\.)*""## => Tok::DoubleString(text[1..(text.len() - 1)].into()),
-    r##"/([^\\/]|\\/|\\.)*/"## => Tok::Rex(text[1..(text.len() - 1)].into()),
+    r##"$/([^\\/]|\\/|\\.)*/"## => Tok::Rex(text[2..(text.len() - 1)].into()),
 
     r##"[0-9]>\&[0-9]"## => { let t = text.as_bytes(); Tok::Redir(t[0] - '0' as u8, t[3] - '0' as u8) },
     r##">\&[0-9]"## => { let t = text.as_bytes(); Tok::Redir(1, t[2] - '0' as u8) },
@@ -117,12 +130,25 @@ lexer! {
     r##">"## => Tok::Gt,
 
     r##"Err!"## => Tok::Ident(text.into()),
-    r##"[_a-zA-Z][_a-zA-Z0-9]*"## => Tok::Ident(text.into()),
+    //r##"[_a-zA-Z][_a-zA-Z0-9]*"## => Tok::Ident(text.into()),
     r##"[_a-zA-Z][_a-zA-Z0-9]*(::[_a-zA-Z][_a-zA-Z0-9]*)*"## => Tok::Ident(text.into()),
-    r##"[_a-zA-Z][_a-zA-Z0-9]*(::[_a-zA-Z][_a-zA-Z0-9]*)*\.[_a-zA-Z][_a-zA-Z0-9]*"## => Tok::Ident(text.into()),
+    //r##"[_a-zA-Z][_a-zA-Z0-9]*(::[_a-zA-Z][_a-zA-Z0-9]*)*\.[_a-zA-Z][_a-zA-Z0-9]*"## => Tok::Ident(text.into()),
     r##"[^ \r\t\n"'\\\$\(\)\{\}\[\]&|,;]+"## => Tok::NakedString(text.into()),
 
     r##"."## => Tok::Error(text.into()),
+}
+
+static NAKED_STRING_RE: &str = r##"^[^ \r\t\n"'\\\$\(\)\{\}\[\]&|,;]+$"##;
+
+pub fn naked_string_regex() -> &'static Regex {
+    lazy_static! {
+        static ref RE: Regex = Regex::new(NAKED_STRING_RE).unwrap();
+    }
+    &*RE
+}
+
+pub fn is_valid_naked_string(s: &str) -> bool {
+    naked_string_regex().is_match(s)
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -132,6 +158,7 @@ enum KWAllow {
     Else,
     Let,
     No,
+    Colon,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -290,12 +317,20 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
                 Tok::LParen | Tok::ExecLParen(_) =>
                     { self.lexer.context.push(')'); next_kw = All; },
 
-                Tok::LBrace | Tok::VarLBrace(_) =>
+                Tok::LSquare | Tok::ExecLSquare(_) =>
+                    { self.lexer.context.push(']'); next_kw = All; },
+
+                Tok::LBrace | Tok::VarLBrace(_) | Tok::LBracePipe =>
                     { self.lexer.context.push('}'); next_kw = All; },
 
                 Tok::RParen => {
                     next_kw = No;
                     pop_expect(&mut self.lexer.context, ')');
+                },
+
+                Tok::RSquare => {
+                    next_kw = No;
+                    pop_expect(&mut self.lexer.context, ']');
                 },
 
                 Tok::RBrace => {
@@ -321,16 +356,20 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
 
                 Tok::If | Tok::While => { next_kw = Let; },
 
-                Tok::Let | Tok::Global | Tok::Sys | Tok::Colon =>
+                Tok::Let | Tok::Global | Tok::Sys =>
                     { next_kw = Assign; }
 
-                Tok::For | Tok::Func | Tok::Match | Tok::Comma |
+                Tok::Colon =>
+                    { next_kw = Colon; }
+
+                Tok::For | Tok::Func | Tok::Match | Tok::MatchAll | Tok::Comma |
                     Tok::Break | Tok::Continue | Tok::Return |
-                    Tok::LSquare | Tok::RSquare | Tok::Gt | Tok::Lt |
+                    Tok::Gt | Tok::Lt |
                     Tok::Var(_) | Tok::Exec(_) | Tok::Redir(_, _) |
                     Tok::Ident(_) | Tok::NakedString(_) | Tok::Range |
                     Tok::SingleString(_) | Tok::DoubleString(_) |
-                    Tok::Rex(_) | Tok::Read =>
+                    Tok::Rex(_) | Tok::Read | Tok::Recv | Tok::Iter |
+                    Tok::LambdaOpen =>
                         { next_kw = No; },
 
                 Tok::Error(_) => {},
@@ -340,45 +379,35 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
             let end_pos = Pos::new(self.lexer.line, self.lexer.pos);
             let span = Span::new(start_pos, end_pos);
 
+            let tok = if let Tok::Iter = tok {
+                if kw == Colon { tok } else { Tok::Ident("iter".into()) }
+            } else { tok };
             let tok = match kw {
                 All => tok,
-                No | Assign | Else | Let => match tok {
-                    Tok::If => Tok::NakedString("if".into()),
-                    Tok::For => Tok::NakedString("for".into()),
-                    Tok::While => Tok::NakedString("while".into()),
+                No | Assign | Else | Let | Colon => match tok {
+                    Tok::If => Tok::Ident("if".into()),
+                    Tok::For => Tok::Ident("for".into()),
+                    Tok::While => Tok::Ident("while".into()),
+                    Tok::Let => if kw == Let { tok } else { Tok::Ident("let".into()) },
+                    Tok::Read => if kw == Let { tok } else { Tok::Ident("read".into()) },
+                    Tok::Recv => if kw == Let { tok } else { Tok::Ident("recv".into()) },
+                    Tok::Global => Tok::Ident("global".into()),
+                    Tok::Sys => Tok::Ident("sys".into()),
+                    Tok::Func => Tok::Ident("fn".into()),
+                    Tok::Match => Tok::Ident("match".into()),
+                    Tok::MatchAll => Tok::Ident("match_all".into()),
+                    Tok::Break => Tok::Ident("break".into()),
+                    Tok::Continue => Tok::Ident("continue".into()),
+                    Tok::Return => Tok::Ident("return".into()),
 
-                    Tok::Let => if kw == Let {
-                                    tok
-                                } else {
-                                    Tok::NakedString("let".into())
-                                },
-
-                    Tok::Read => if kw == Let {
-                                    tok
-                                } else {
-                                    Tok::NakedString("read".into())
-                                },
-
-                    Tok::Global => Tok::NakedString("global".into()),
-                    Tok::Sys => Tok::NakedString("sys".into()),
-                    Tok::Func => Tok::NakedString("fn".into()),
-                    Tok::Match => Tok::NakedString("match".into()),
-                    Tok::Break => Tok::NakedString("break".into()),
-                    Tok::Continue => Tok::NakedString("continue".into()),
-                    Tok::Return => Tok::NakedString("return".into()),
-
-                    Tok::Else => if kw == Else {
-                                     tok
-                                 } else {
-                                     Tok::NakedString("else".into())
-                                 },
+                    Tok::Else => if kw == Else { tok } else { Tok::Ident("else".into()) },
 
                     _ => tok,
                 }
             };
 
             let tok = match kw {
-                All | Assign => match tok {
+                All | Assign | Colon => match tok {
                     Tok::NakedString(s) => {
                         if let Some(t) = self.split_assign(&s, span) {
                             t
