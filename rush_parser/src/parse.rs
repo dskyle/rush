@@ -169,6 +169,13 @@ parser! {
             Ok(ExprS(Expr::Tuple(TupleStyle::Comma, vec![]), span!())),
     }
 
+    member: Res<ExprS> {
+        #[no_reduce(LSquare)]
+        indexing[i] ws => i,
+        member[l] ws Member(m) ws var_ref_inline[r] ws => make_member(l?, m, r?, span!()),
+        member[l] ws Member(m) ws parens[r] ws => make_member(l?, m, r?, span!()),
+    }
+
     subexpr2: Res<ExprS> {
         if_rule[i] => i,
         while_rule[w] => w,
@@ -260,10 +267,11 @@ parser! {
     }
 
     ws_tuple: Res<Vec<ExprS>> {
-        #[no_reduce(Comma)]
-        subexpr2[a] ws => Ok(vec![a?]),
+        #[no_reduce(Comma, LSquare, Member)]
+        member[a] ws => Ok(vec![a?]),
 
-        ws_tuple[tup] subexpr2[a] => {
+        #[no_reduce(LSquare, Member)]
+        ws_tuple[tup] member[a] ws => {
             let mut tup = tup?; tup.push(a?); Ok(tup)
         },
     }
@@ -271,12 +279,12 @@ parser! {
     comma_tuple: Res<Vec<ExprS>> {
         #[no_reduce(Range, Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen,
                     ExecLSquare, Read, Recv, If, While, For, Match, MatchAll, LBracePipe, LambdaOpen)]
-        subexpr2[a] ws Comma ws => Ok(vec![a?]),
+        member[a] ws Comma ws => Ok(vec![a?]),
 
-        #[no_reduce(Comma)]
-        subexpr2[a] ws Comma ws subexpr2[b] ws => Ok(vec![a?, b?]),
+        #[no_reduce(Comma, LSquare, Member)]
+        member[a] ws Comma ws member[b] ws => Ok(vec![a?, b?]),
 
-        subexpr2[a] ws Comma ws comma_tuple[tup] => {
+        member[a] ws Comma ws comma_tuple[tup] => {
             let tup = tup?; let mut v = vec![a?]; v.extend(tup); Ok(v)
         },
     }
@@ -319,24 +327,49 @@ parser! {
         VarLBrace(s) ws stmt2[n] ws RBrace => Ok((s, n?)),
     }
 
+                  /*
+    var_ref_expr: Res<ExprS> {
+        VarLBrace(m) ws atom[n] ws => ExprS(Expr::Var(parse_subs_mode(m.trim_right_matches('{'), span!())?, Box::new(n)),nspan),
+        var_ref_expr[e] ws LSquare nl expr[i] nl RSquare ws => {
+            Ok(ExprS(Expr::Index(SubsMode::new(), Box::new(e?), Box::new(i?)), span!()))
+        ,
+    }*/
+
     var_ref: Res<ExprS> {
         var_ref_init[t] => {
             let (s, n) = t?;
-            match n.0 {
-                Expr::Ident(_) | Expr::Var(..) => Ok(ExprS::var(parse_subs_mode(s.trim_right_matches('{'), span!())?, n, span!())),
-                //Expr::String(_) | Expr::XString(_) =>
-                _ => Ok(ExprS::call(parse_subs_mode(s.trim_right_matches('{'), span!())?, n, span!())),
-                //Expr::Tuple(..) =>
-                    //Ok(ExprS::call(parse_subs_mode(s.trim_right_matches('{'), span!())?, n, span!())),
-                //_ => Err(InvalidVarRef(n)),
+            let m = parse_subs_mode(s.trim_right_matches('{'), span!())?;
+            fn fixup(m: SubsMode, n: ExprS, span: Span) -> Res<ExprS> {
+                match n.0 {
+                    Expr::Ident(_) | Expr::Var(..) => Ok(ExprS::var(m, n, span)),
+                    //Expr::String(_) | Expr::XString(_) =>
+                    Expr::Member(_, val, call) => {
+                        let new_val: ExprS = fixup(SubsMode::new(), *val, span)?;
+                        Ok(ExprS(Expr::Member(m, Box::new(new_val), call), span))
+                    },
+                    Expr::Index(_, val, idx) => {
+                        let new_val: ExprS = fixup(SubsMode::new(), *val, span)?;
+                        Ok(ExprS(Expr::Index(m, Box::new(new_val), idx), span))
+                    },
+                    _ => Ok(ExprS::call(m, n, span)),
+                    //Expr::Tuple(..) =>
+                        //Ok(ExprS::call(parse_subs_mode(s.trim_right_matches('{'), span!())?, n, span!())),
+                    //_ => Err(InvalidVarRef(n)),
+                }
             }
+            fixup(m, n, span!())
 
         },
 
-        Var(s) indexing[idx] => Ok(make_index_call(idx?, span!(), s.as_str())?),
+        //Var(s) indexing[idx] => Ok(make_index_call(idx?, span!(), s.as_str())?),
 
-        VarLBrace(s) ws indexing[idx] ws RBrace =>
-            Ok(make_index_call(idx?, span!(), s.trim_right_matches('{'))?),
+        /*
+        var_ref_expr[e] ws RBrace ws => {
+            let mut e = e?;
+            e.0.set_subs_mode(m);
+            Ok(e)
+            //Ok(make_index_call(idx?, span!(), s.trim_right_matches('{'))?),
+        }*/
     }
 
              /*
@@ -458,23 +491,29 @@ parser! {
         For ws expr[bind] nl Colon nl subexpr[iter] nl block[lo] ws => {
             let pat = ExprS::to_pat(bind?)?;
             let iter = iter?;
+            let iter_span = iter.1;
             if let ExprS(Expr::Range(..), ..) = iter {
-                Ok(ExprS(Expr::ForIter{pat: pat, iter: Box::new(iter), lo: lo?}, span!()))
+                Ok(ExprS(Expr::ForIter{pat: pat, iter:
+                    Box::new(ExprS(Expr::Call(SubsMode::new(), Box::new(ExprS(Expr::Tuple(TupleStyle::Named, vec![
+                        ExprS(Expr::Ident("iter".into()), iter.1),
+                        iter]), iter_span)), vec![]), iter_span)), lo: lo?}, span!()))
             } else {
                 Ok(ExprS(Expr::For{pat: pat, val: Box::new(iter), lo: lo?}, span!()))
             }
         },
 
-        For ws expr[bind] nl Colon nl Iter nl subexpr[iter] nl block[lo] ws => {
+        For ws expr[bind] nl DoubleColon nl subexpr[iter] nl block[lo] ws => {
             let pat = ExprS::to_pat(bind?)?;
             Ok(ExprS(Expr::ForIter{pat: pat, iter: Box::new(iter?), lo: lo?}, span!()))
         },
     }
 
     indexing: Res<ExprS> {
-        ident[n] LSquare nl expr[i] nl RSquare => {
-            let n = n?; let i = i?;
-            Ok(ExprS(Expr::Index((n.0.get_atom().unwrap(), n.1), Box::new(ExprS(i.0, i.1))), span!()))
+        subexpr2[n] ws => n,
+        indexing[n] ws LSquare nl expr[i] nl RSquare ws => {
+            let mut n = n?;
+            let m = n.0.take_subs_mode().unwrap_or(SubsMode::new());
+            Ok(ExprS(Expr::Index(m, Box::new(n), Box::new(i?)), span!()))
         },
     }
 
@@ -489,8 +528,8 @@ parser! {
     }
 
     set_lhs: Res<ExprS> {
-        atom[e] ws => e,
-        indexing[i] ws => i,
+        //atom[e] ws => e,
+        member[i] ws => i,
     }
 
     id_list: Res<Vec<ExprS>> {
@@ -653,6 +692,7 @@ fn parse_subs_mode(s: &str, span: Span) -> Res<SubsMode> {
     return Ok(ret)
 }
 
+/*
 fn make_index_call(idx: ExprS, span: Span, s: &str) -> Res<ExprS> {
     if let ExprS(Expr::Index((n, ns), i), _) = idx {
         Ok(ExprS::call(parse_subs_mode(s, span)?, ExprS::tuple(TupleStyle::Named, vec![
@@ -662,7 +702,6 @@ fn make_index_call(idx: ExprS, span: Span, s: &str) -> Res<ExprS> {
     } else { unreachable!() }
 }
 
-/*
 fn make_member_call(t: ExprS) {
     if let ExprS(Expr::Tuple(t), span) = t {
         if t.len() >= 1 {
@@ -834,4 +873,8 @@ fn process_xstring(s: String, span: Span) -> Vec<ExprS> {
     }
     xstring_ensure_last_is_str(&mut ret);
     return ret;
+}
+
+fn make_member(l: ExprS, m: String, r: ExprS, span: Span) -> Res<ExprS> {
+    Ok(ExprS(Expr::Member(parse_subs_mode(&m[2..], l.1)?, Box::new(l), Box::new(r)), span))
 }

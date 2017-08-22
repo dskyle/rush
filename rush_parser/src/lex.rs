@@ -18,6 +18,7 @@ pub enum Tok {
     Semi,
     Range,
     Colon,
+    DoubleColon,
     Pipe,
     LBracePipe,
     LambdaOpen,
@@ -26,6 +27,7 @@ pub enum Tok {
     Gt,
     Assign,
     Into,
+    Member(String),
     AssignIfNull,
     Suffix,
     Prefix,
@@ -38,7 +40,6 @@ pub enum Tok {
     Else,
     While,
     For,
-    Iter,
     Match,
     MatchAll,
     Return,
@@ -78,7 +79,6 @@ lexer! {
     r##"else"## => Tok::Else,
     r##"while"## => Tok::While,
     r##"for"## => Tok::For,
-    r##"iter"## => Tok::Iter,
     r##"fn"## => Tok::Func,
     r##"match"## => Tok::Match,
     r##"match_all"## => Tok::MatchAll,
@@ -88,10 +88,12 @@ lexer! {
 
     r##"="## => Tok::Assign,
     r##"=>"## => Tok::Into,
+    r##"\$\.(|,|-|,-|-,)"## => Tok::Member(text.into()),
     r##"\?="## => Tok::AssignIfNull,
     r##"\+="## => Tok::Suffix,
     r##"^="## => Tok::Prefix,
     r##":"## => Tok::Colon,
+    r##"::"## => Tok::DoubleColon,
     r##","## => Tok::Comma,
     r##";"## => Tok::Semi,
     r##"\.\.\."## => Tok::Range,
@@ -115,7 +117,7 @@ lexer! {
     r##"\$\("## => Tok::ExecLParen(text.into()),
     r##"\$(|,|-|,-|-,)\["## => Tok::ExecLSquare(text.into()),
 
-    r##"\$(|,)"## => Tok::Var(text.into()),
+    r##"\$(|,|-|,-|-,)"## => Tok::Var(text.into()),
 
     r##"'([^'])*'"## => Tok::SingleString(text.trim_matches('\'').into()),
     r##""([^\\"]|\\"|\\.)*""## => Tok::DoubleString(text[1..(text.len() - 1)].into()),
@@ -158,7 +160,6 @@ enum KWAllow {
     Else,
     Let,
     No,
-    Colon,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -359,17 +360,14 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
                 Tok::Let | Tok::Global | Tok::Sys =>
                     { next_kw = Assign; }
 
-                Tok::Colon =>
-                    { next_kw = Colon; }
-
                 Tok::For | Tok::Func | Tok::Match | Tok::MatchAll | Tok::Comma |
                     Tok::Break | Tok::Continue | Tok::Return |
                     Tok::Gt | Tok::Lt |
                     Tok::Var(_) | Tok::Exec(_) | Tok::Redir(_, _) |
                     Tok::Ident(_) | Tok::NakedString(_) | Tok::Range |
                     Tok::SingleString(_) | Tok::DoubleString(_) |
-                    Tok::Rex(_) | Tok::Read | Tok::Recv | Tok::Iter |
-                    Tok::LambdaOpen =>
+                    Tok::Rex(_) | Tok::Read | Tok::Recv | Tok::LambdaOpen |
+                    Tok::Member(..) | Tok::Colon | Tok::DoubleColon =>
                         { next_kw = No; },
 
                 Tok::Error(_) => {},
@@ -379,12 +377,9 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
             let end_pos = Pos::new(self.lexer.line, self.lexer.pos);
             let span = Span::new(start_pos, end_pos);
 
-            let tok = if let Tok::Iter = tok {
-                if kw == Colon { tok } else { Tok::Ident("iter".into()) }
-            } else { tok };
             let tok = match kw {
                 All => tok,
-                No | Assign | Else | Let | Colon => match tok {
+                No | Assign | Else | Let => match tok {
                     Tok::If => Tok::Ident("if".into()),
                     Tok::For => Tok::Ident("for".into()),
                     Tok::While => Tok::Ident("while".into()),
@@ -407,7 +402,7 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
             };
 
             let tok = match kw {
-                All | Assign | Colon => match tok {
+                All | Assign => match tok {
                     Tok::NakedString(s) => {
                         if let Some(t) = self.split_assign(&s, span) {
                             t

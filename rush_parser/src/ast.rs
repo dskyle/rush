@@ -244,7 +244,8 @@ pub enum Expr {
     ForIter{pat: Pat, iter: Box<ExprS>, lo: Vec<ExprS>},
     Match{val: Box<ExprS>, cases: Vec<(Pat, ExprS)>},
     MatchAll{val: Box<ExprS>, cases: Vec<(Pat, ExprS)>},
-    Index((String, Span), Box<ExprS>),
+    Index(SubsMode, Box<ExprS>, Box<ExprS>),
+    Member(SubsMode, Box<ExprS>, Box<ExprS>),
     Range(ASTRange),
     Break(Option<Box<ExprS>>),
     Continue(Option<Box<ExprS>>),
@@ -569,6 +570,32 @@ impl Expr {
         }
     }
 
+    pub fn set_subs_mode(&mut self, new_m: SubsMode) -> Option<SubsMode> {
+        use ast::Expr::*;
+        match *self {
+            Index(ref mut m, ..) | Call(ref mut m, ..) | Var(ref mut m, ..) | Exec(ref mut m, ..) |
+                ExecList(ref mut m, ..) | Member(ref mut m, ..) => {
+                    let ret = Some(*m);
+                    *m = new_m;
+                    ret
+                },
+            _ => None,
+        }
+    }
+
+    pub fn get_subs_mode(&self) -> Option<SubsMode> {
+        use ast::Expr::*;
+        match *self {
+            Index(m, ..) | Call(m, ..) | Var(m, ..) | Exec(m, ..) |
+                ExecList(m, ..) | Member(m, ..) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn take_subs_mode(&mut self) -> Option<SubsMode> {
+        self.set_subs_mode(SubsMode::new())
+    }
+
     pub fn is_value(&self) -> bool {
         use self::Expr::*;
 
@@ -613,7 +640,8 @@ impl fmt::Debug for Expr {
             &Recv(ref p) => write!(f, "Recv({:#?})", p),
             &Set(o, ref l, ref r) => write!(f, "{:#?}({:#?} = {:#?})", o, l, r),
             &Import(s, ref l, ref r, ref i) => write!(f, "Import({:#?} {:#?} : {:#?} = {:#?})", s, l, r, i),
-            &Index(ref n, ref i) => write!(f, "Index({:#?}[{:#?}])", n, i),
+            &Index(_, ref n, ref i) => write!(f, "Index({:#?}[{:#?}])", n, i),
+            &Member(_, ref l, ref r) => write!(f, "({:#?}$.{:#?})", l, r),
             &And(ref l, ref r) => write!(f, "({:#?} && {:#?})", l, r),
             &Or(ref l, ref r) => write!(f, "({:#?} || {:#?})", l, r),
             &FuncDec(ref p, ref b) => write!(f, "fn {:#?} {:#?}", p, b),

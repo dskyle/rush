@@ -110,7 +110,6 @@ fn do_interactive_lf() {
 
                 let diff = {
                     let last = reader.history().last().unwrap_or("");
-                    println!("{:?} ?= {:?}", input, last);
                     last != input
                 };
                 if diff { reader.add_history(input.clone()) }

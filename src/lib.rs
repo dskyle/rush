@@ -239,7 +239,7 @@ pub mod util {
                 }
             },
             Err(error) => {
-                Val::err_string(format!("{}",error))
+                Val::err_string(format!("Error calling {:?}: {}", val, error))
             },
         }
     }
@@ -591,10 +591,13 @@ mod builtins {
     pub fn header_iter_start(i: &Interp, locs: &mut LocalVars) -> Val
     {
         use rush_parser::ast::Span;
-        let iter = locs.get("iter").unwrap().get();
+        let mut iter = locs.get("iter").unwrap().get();
+        let mut header = locs.get("header").unwrap().get();
         if iter.len() < 2|| iter.is_err() { return iter }
-        let header = iter.iter().nth(1).unwrap().clone();
-        let iter = i.call_next(locs, iter, Span::zero());
+        if header.len() == 0 {
+            header = iter.iter().nth(1).unwrap().clone();
+            iter = i.call_next(locs, iter, Span::zero());
+        }
         let val = iter.iter().nth(1).unwrap().clone();
 
         Val::Tup(vec![Val::str("header::Iter"), header.pair_with(&val), iter, header])
@@ -753,6 +756,7 @@ impl Processor {
             fns.reg(Func::built_in(mk_pat!( ("expand", {range = ("Range", ...)}) ), builtins::expand_range));
             fns.reg(Func::built_in(mk_wild_pat("val"), builtins::val));
             fns.reg(Func::built_in(mk_pat!( ("op::index", {tup}, {i}) ), builtins::index));
+            fns.reg(Func::built_in(mk_pat!( ("op::get_prop", {tup}, {i}) ), builtins::index));
             fns.reg(Func::built_in(mk_binary_pat("equals"), builtins::equals));
             fns.reg(Func::built_in(mk_wild_pat("cd"), builtins::cd));
             fns.reg(Func::built_in(mk_noarg_pat("jobs"), builtins::jobs));
@@ -761,13 +765,13 @@ impl Processor {
             fns.reg(Func::built_in(mk_pat!( ("iter", ("Range", {l}, {r})) ), builtins::range_iter_start));
             fns.reg(Func::built_in(mk_pat!( ("next", ("Range::Iter", {cur}, {l}, {r})) ), builtins::range_iter_next));
 
-            fns.reg(Func::built_in(mk_pat!( ("iter", "readline") ), builtins::readline_iter_start));
+            fns.reg(Func::built_in(mk_pat!( ("readline") ), builtins::readline_iter_start));
             fns.reg(Func::built_in(mk_pat!( ("next", ("readline::Iter", {cur})) ), builtins::readline_iter_next));
 
-            fns.reg(Func::built_in(mk_pat!( ("iter", ("map", {iter}, {op})) ), builtins::map_iter_start));
+            fns.reg(Func::built_in(mk_pat!( ("map", {iter}, {op}) ), builtins::map_iter_start));
             fns.reg(Func::built_in(mk_pat!( ("next", ("map::Iter", {cur}, {iter}, {op})) ), builtins::map_iter_next));
 
-            fns.reg(Func::built_in(mk_pat!( ("iter", ("header", {iter})) ), builtins::header_iter_start));
+            fns.reg(Func::built_in(mk_pat!( ("header", {iter}, [{header}]) ), builtins::header_iter_start));
             fns.reg(Func::built_in(mk_pat!( ("next", ("header::Iter", {cur}, {iter}, {header})) ), builtins::header_iter_next));
 
             fns.reg(Func::mac("iter", builtins::list_iter_start));

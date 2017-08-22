@@ -476,7 +476,7 @@ impl Interp {
     }
 
     fn do_match(&self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
-        let (mut val, mut con) = self.from_expr(e, r);
+        let (val, con) = self.from_expr(e, r);
         if con.stops_exec() {
             return (val, con)
         }
@@ -493,7 +493,7 @@ impl Interp {
     }
 
     fn do_match_all(&self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
-        let (val, mut con) = self.from_expr(e, r);
+        let (val, con) = self.from_expr(e, r);
         if con.stops_exec() {
             return (val, con)
         }
@@ -515,13 +515,10 @@ impl Interp {
 
     fn do_for(&self, r: &mut LocalVars, pat: &Pat, val: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
         let mut res = (Val::void(), Control::Done);
-        let ispan = val.1;
         let val = self.from_expr(val, r);
         if val.1.stops_exec() {
             return val
         }
-
-        println!("{:?}", val);
 
         Cow::from(val.0).for_each_shallow(&mut |val: Cow<Val>| {
             if pat.subsumes(&*val) == Subsumption::Contains {
@@ -555,11 +552,11 @@ impl Interp {
     fn do_for_iter(&self, r: &mut LocalVars, pat: &Pat, iter: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
         let mut res = (Val::void(), Control::Done);
         let ispan = iter.1;
-        let val = self.from_expr(iter, r);
-        if val.1.stops_exec() {
-            return val
+        let (mut cur, con) = self.from_expr(iter, r);
+        if con.stops_exec() {
+            return (cur, con)
         }
-        let mut cur = self.call_iter(r, val.0, ispan);
+        //let mut cur = self.call_iter(r, val.0, ispan);
         loop {
             {
                 if cur.is_err() { return (cur, Control::Done) }
@@ -738,6 +735,48 @@ impl Interp {
             ForIter{ref pat, ref iter, ref lo} => self.do_for_iter(r, pat, iter, lo),
             Read(ref ids) => self.do_read(ids, r),
             Recv(ref pat) => self.do_recv(pat, r, false),
+            Member(m, ref lhs, ref rhs) => {
+                let (lval, con) = self.from_expr(&**lhs, r);
+                if con.stops_exec() {
+                    return (lval, con);
+                }
+                if lval.is_err() {
+                    return (lval, Control::Done);
+                }
+                let (mut rval, con) = self.from_expr(&**rhs, r);
+                if con.stops_exec() {
+                    return (rval, con);
+                }
+                rval.eval();
+                let to_call = match rval {
+                    e @ Val::Error(..) => return (e, Control::Done),
+                    Val::Str(s) => vec![Val::Str("op::get_prop".into()), lval, Val::Str(s)],
+                    Val::Tup(mut v) => { v.insert(1, lval); v },
+                    _ => unreachable!(),
+                };
+                let val = self.call(Val::Tup(to_call), e.1, r);
+                (val.subst(m), Control::Done)
+            },
+            Index(m, ref val, ref index) => {
+                let (val, con) = self.from_expr(&**val, r);
+                if con.stops_exec() {
+                    return (val, con);
+                }
+                if val.is_err() {
+                    return (val, Control::Done);
+                }
+                let (mut index, con) = self.from_expr(&**index, r);
+                if con.stops_exec() {
+                    return (index, con);
+                }
+                index.eval();
+                if index.is_err() {
+                    return (index, Control::Done)
+                }
+                let to_call = vec![Val::Str("op::index".into()), val, index];
+                let val = self.call(Val::Tup(to_call), e.1, r);
+                (val.subst(m), Control::Done)
+            },
             _ => unimplemented!(),
         }
     }
@@ -908,18 +947,22 @@ impl Interp {
                     &ExprS(Expr::Ident(ref id), _) => {
                         Self::do_set(op, id, Indexing::NoIndex, val.0, local_vars);
                     },
-                    &ExprS(Expr::Index((ref id, _), ref index), _) => {
-                        let (index, con) = self.from_expr(&*index, local_vars);
-                        return index.with_val(move |index| {
-                            if con.stops_exec() {
-                                return (Val::void(), con);
-                            }
-                            match Indexing::from_val(&index) {
-                                Ok(index) => Self::do_set(op, id, index, val.0, local_vars),
-                                Err(err) => return (err, Control::Done),
-                            };
-                            (Val::void(), Control::Done)
-                        })
+                    &ExprS(Expr::Index(_, box ExprS(ref id, _), ref index), _) => {
+                        if let Some(id) = id.get_ident() {
+                            let (index, con) = self.from_expr(&*index, local_vars);
+                            return index.with_val(move |index| {
+                                if con.stops_exec() {
+                                    return (Val::void(), con);
+                                }
+                                match Indexing::from_val(&index) {
+                                    Ok(index) => Self::do_set(op, id, index, val.0, local_vars),
+                                    Err(err) => return (err, Control::Done),
+                                };
+                                (Val::void(), Control::Done)
+                            })
+                        } else {
+                            panic!("Left-hand-side of indexing not an identifier")
+                        }
                     },
                     _ =>
                         panic!("Left-hand-side of assignment not an identifier"),
@@ -987,7 +1030,7 @@ impl Interp {
             },
             Expr::Tuple(..) | Expr::Ident(..) | Expr::String(..) | Expr::XString(..) | Expr::Range(..) |
                 Expr::LString(..) | Expr::Exec(..) | Expr::ExecList(..) | Expr::Call(..) | Expr::Var(..) | Expr::Lambda(..) |
-                Expr::Index(..) | Expr::Rex(..) => {
+                Expr::Rex(..) => {
                 let (val, con) = self.from_expr(stmt_s, local_vars);
                 //println!("Will call {:?} => {:?}", stmt, val);
                 if con.stops_exec() {
@@ -999,7 +1042,7 @@ impl Interp {
             },
             Expr::Nop => { (Val::void(), Control::Done) },
             Expr::If{..} | Expr::While{..} | Expr::Match{..} | Expr::MatchAll{..} | Expr::For{..} | Expr::ForIter{..} |
-                Expr::Block(..) | Expr::Read(..) | Expr::Recv(..) => {
+                Expr::Block(..) | Expr::Read(..) | Expr::Recv(..) | Expr::Member(..) | Expr::Index(..) => {
                 self.from_expr(stmt_s, local_vars)
             },
             Expr::Background(ref expr) => {
