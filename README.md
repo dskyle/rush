@@ -1,7 +1,8 @@
 `rush` is a new command line shell inspired by, and implemented in, the Rust
 programming language. It is still in early development. Focus so far has been
-on the core language engine and novel features. Many expected of the normal, expected
-features of shells are not yet in place. As such, production usage of `rush`
+on the core language engine and novel features. Many of the normal, expected
+features of shells, such as job control and tab completion, are not yet in
+place. As such, production usage of `rush`
 is not advisable, but feedback and contributions are welcome.
 
 See the [Wiki](https://github.com/dskyle/rush/wiki) for reference documentation.
