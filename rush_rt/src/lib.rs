@@ -3,6 +3,7 @@
 #![feature(box_patterns)]
 #![feature(try_from)]
 #![feature(conservative_impl_trait)]
+#![feature(slice_get_slice)]
 
 extern crate rush_parser;
 extern crate rush_pat;

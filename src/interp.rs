@@ -1,6 +1,5 @@
 use rush_parser::ast::{ExprS, Expr, SetOp, ImportScope, SubsMode, Span};
 use rush_pat::pat::Pat;
-use rush_pat::range::Range;
 use rush_rt::vars::{VarRef, LocalVars, Resolver, Binder, Scoped};
 use rush_rt::val::{Val, InternalIterable};
 use rush_rt::error::{RuntimeError};
@@ -53,44 +52,6 @@ pub struct Interp {
     pub jobs: RefCell<Jobs>,
 }
 
-fn new_vec_init<T: Clone>(index: i64, def: T, val: T) -> Vec<T> {
-    if index >= 0 {
-        let index = index as usize;
-        let mut ret = vec![def; index + 1];
-        ret[index] = val;
-        ret
-    } else {
-        let mut ret = vec![def; -index as usize];
-        ret[0] = val;
-        ret
-    }
-}
-
-#[derive(Debug)]
-pub enum Indexing<'a> {
-    NoIndex,
-    Offset(i64),
-    Dict(&'a str),
-    Range(Range),
-}
-
-impl<'a> Indexing<'a> {
-    pub fn from_val(val: &'a Val) -> Result<Indexing, Val> {
-        if let Some(i) = val.get_str() {
-            if let Ok(i) = str::parse::<i64>(i) {
-                Ok(Indexing::Offset(i))
-            } else {
-                Ok(Indexing::Dict(i))
-            }
-        } else if let Ok(rng) = Range::from_val(val) {
-            Ok(Indexing::Range(rng))
-        } else {
-            Err(Val::err(RuntimeError::InvalidIndex(val.clone().into(),
-                         "Index must be a scalar or range"), None))
-        }
-    }
-}
-
 impl Interp {
     pub fn new() -> Interp {
         Interp {
@@ -99,199 +60,6 @@ impl Interp {
             funcs: FuncMap::new().into(),
             jobs: Jobs::new().into()
         }
-    }
-
-    fn do_set(op: SetOp, id: &str, index: Indexing, val: Val, local_vars: &mut LocalVars) {
-        use self::Val::*;
-
-        fn apply_op(op: SetOp, cur: &mut Val, new: Val) {
-            use self::SetOp::*;
-            match op {
-                Assign => *cur = new,
-                AssignIfNull => if cur.is_void() {
-                    *cur = new;
-                },
-                Suffix => match cur {
-                    &mut Val::Tup(ref mut v) => {
-                        v.push(new);
-                    },
-                    _ => {
-                        let mut tmp = Val::void();
-                        ::std::mem::swap(&mut tmp, cur);
-                        *cur = Val::Tup(vec![tmp, new]);
-                    },
-                },
-                Prefix => match cur {
-                    &mut Val::Tup(ref mut v) => {
-                        v.insert(0, new);
-                    },
-                    _ => {
-                        let mut tmp = Val::void();
-                        ::std::mem::swap(&mut tmp, cur);
-                        *cur = Val::Tup(vec![new, tmp]);
-                    },
-                },
-            }
-        }
-
-        use std::ops::DerefMut;
-
-        fn apply_op_var_ref(op: SetOp, r: &VarRef, val: Val) {
-            apply_op(op, r.get_mut().deref_mut(), val);
-        }
-
-        fn apply_op_void(op: SetOp, val: Val) -> Val {
-            let mut new = Val::void();
-            apply_op(op, &mut new, val);
-            return new;
-        }
-
-        fn do_set_offset(op: SetOp, var: &VarRef, index: i64, val: Val) {
-            let mut orig = var.get_mut();
-            let mut n = None;
-            match *orig {
-                Tup(ref mut v) => {
-                    if index >= 0 {
-                        let index = index as usize;
-                        if v.len() <= index {
-                            v.resize(index + 1, Val::void())
-                        }
-                        //v[index] = val;
-                        apply_op(op, &mut v[index], val);
-                    } else {
-                        let index = v.len() as i64 + index;
-                        if index < 0 {
-                            v.splice(0..0, ::std::iter::repeat(Val::void()).take(-index as usize));
-                            apply_op(op, &mut v[0], val);
-                        } else {
-                            apply_op(op, &mut v[index as usize], val);
-                        }
-                    }
-                },
-                Str(_) => {
-                    let val = apply_op_void(op, val);
-                    n = Some(Tup(new_vec_init(index, Val::void(), val)));
-                },
-                _ => panic!("Attempted to set non-scalar or tuple: {:?}", val)
-            }
-            if let Some(n) = n {
-                *orig = n;
-            }
-        }
-
-        fn do_set_dict(op: SetOp, var: &VarRef, key: &str, val: Val) {
-            let mut orig = var.get_mut();
-            let mut err = false;
-            let mut tuplefy = false;
-            match *orig {
-                Tup(ref mut v) => {
-                    for cur in v {
-                        match *cur {
-                            Tup(ref mut v) if v.len() == 2 &&
-                                    v[0].get_str().map_or(false, |x| x == key) => {
-                                apply_op(op, &mut v[1], val);
-                                return;
-                            },
-                            _ => {},
-                        }
-                    }
-                },
-                Str(_) => {
-                    tuplefy = true;
-                },
-                _ => err = true,
-            }
-            if err { panic!("Attempted to set non-scalar or tuple: {:?}", val); }
-            if tuplefy {
-                let mut o = Val::void();
-                ::std::mem::swap(&mut o, &mut *orig);
-                *orig = Tup(vec![o]);
-            }
-            if let Tup(ref mut v) = *orig {
-                let val = apply_op_void(op, val);
-                v.push(Tup(vec![Val::str(key), val]));
-            } else {
-                unreachable!();
-            }
-        }
-
-        fn do_set_range(op: SetOp, var: &VarRef, l: i64, r: i64, val: Val) {
-            if let SetOp::Assign = op {
-                fn wrap_index(index: i64, len: usize) -> i64 {
-                    if index >= 0 {
-                        index
-                    } else {
-                        len as i64 + index
-                    }
-                }
-
-                let val_into_iter = |val| {
-                    let iter = match val {
-                        Val::Tup(val) => val.into_iter(),
-                        Val::Ref(_) => vec!(Val::Embed(Box::new(val))).into_iter(),
-                        _ => vec!(val).into_iter(),
-                    };
-                    iter
-                };
-
-                let mut mut_ref = var.get_mut();
-                let cur = mut_ref.deref_mut();
-                match cur {
-                    &mut Val::Tup(ref mut cur) => {
-                        let n = cur.len() as i64;
-                        let l = wrap_index(l, n as usize);
-                        let r = wrap_index(r, n as usize);
-                        let iter = val_into_iter(val);
-                        use std::iter::repeat;
-                        if l < 0 {
-                            if r < 0 {
-                                let iter = iter.chain(repeat(Val::void()).take((-r - 1) as usize));
-                                cur.splice(0..0, iter);
-                            } else if r < n {
-                                cur.splice(0...r as usize, iter);
-                            } else {
-                                *cur = iter.collect();
-                            }
-                        } else if l < n {
-                            if r < n {
-                                cur.splice(l as usize...r as usize, iter);
-                            } else {
-                                cur.splice(l as usize..n as usize, iter);
-                            }
-                        } else {
-                            let iter = repeat(Val::void()).take((l - n) as usize).chain(iter);
-                            cur.splice(n as usize..n as usize, iter);
-                        }
-                    },
-                    _ => {
-                        unimplemented!();
-                    }
-                }
-            } else {
-                unimplemented!();
-            }
-        }
-
-        if let Some(var) = local_vars.get(id) {
-            //println!("Set {:?} from {:?} to {:?} using {:?}", id, old_val, val, op);
-            match index {
-                Indexing::NoIndex => apply_op_var_ref(op, var, val),
-                Indexing::Offset(index) => do_set_offset(op, var, index, val),
-                Indexing::Dict(key) => do_set_dict(op, var, key, val),
-                Indexing::Range(Range::WithinInt(l, r)) => do_set_range(op, var, l, r, val),
-                _ => unimplemented!(),
-            }
-            return; // Use this instead of "else" to make borrow checker happy
-        }
-
-        let val = apply_op_void(op, val);
-        //println!("Implicit bind {:?} to {:?}", id, val);
-        local_vars.bind(id, match index {
-            Indexing::NoIndex => val,
-            Indexing::Offset(index) => Tup(new_vec_init(index, Val::void(), val)),
-            Indexing::Dict(key) => Tup(vec![Tup(vec![Val::str(key), val])]),
-            _ => unimplemented!(),
-        });
     }
 
     fn get_varmap(&self, scope: ImportScope) -> &RefCell< VarMap> {
@@ -923,6 +691,111 @@ impl Interp {
         }
     }
 
+    pub fn do_set(&self, op: SetOp, n: &ExprS, mut val: Val, local_vars: &mut LocalVars) -> Val {
+        fn imp(this: &Interp, n: &ExprS, l: &mut LocalVars, f: &mut FnMut(&mut Val)) -> Result<(), Val> {
+            fn do_id(id: &str, l: &mut LocalVars, f: &mut FnMut(&mut Val)) -> Result<(), Val> {
+                if let Some(var) = l.get(id) {
+                    f(&mut *var.get_mut());
+                    return Ok(());
+                }
+                let var = l.bind(id.clone(), Val::void());
+                f(&mut *var.get_mut());
+                Ok(())
+            }
+
+            match n.0 {
+                Expr::Ident(ref id) => {
+                    do_id(id, l, f)
+                },
+                Expr::Index(_, ref lhs, ref index) => {
+                    use rush_rt::val::Indexing;
+                    let (index, con) = this.from_expr(&*index, l);
+                    return index.with_val(move |index| {
+                        if con.stops_exec() {
+                            return Ok(());
+                        }
+                        match Indexing::from_val(&index) {
+                            Ok(index) => {
+                                imp(this, lhs, l, &mut |v: &mut Val| {
+                                    v.with_index_mut(&index, &mut |v: &mut Val| {
+                                        f(v);
+                                    }).unwrap();
+                                })
+                            },
+                            Err(err) => return Err(err),
+                        }
+                    })
+                },
+                Expr::Member(..) => {
+                    Err(Val::err_str("Setting to members not suppported"))
+                },
+                Expr::Tuple(..) => {
+                    Err(Val::err_str("Setting to tuples not suppported"))
+                },
+                _ => {
+                    let (val, con) = this.from_expr(n, l);
+                    if con.stops_exec() {
+                        return Ok(())
+                    }
+                    match val.take_str() {
+                        Ok(ref id) if ::rush_parser::lex::is_identifier(id) => {
+                            do_id(id, l, f)
+                        },
+                        Ok(id) => {
+                            Err(Val::err_string(format!("Invalid identifier: {:?}", id)))
+                        },
+                        Err(val) => {
+                            Err(Val::err_string(format!("Invalid identifier: {:?}", val)))
+                        },
+                    }
+                }
+            }
+        }
+
+        match imp(self, n, local_vars, &mut |old_val: &mut Val| {
+            use self::SetOp::*;
+            match op {
+                Assign => {
+                    ::std::mem::swap(old_val, &mut val);
+                },
+                AssignIfNull => if old_val.is_void() {
+                    ::std::mem::swap(old_val, &mut val);
+                },
+                Suffix => match old_val {
+                    &mut Val::Tup(ref mut v) => {
+                        let mut tmp = Val::void();
+                        ::std::mem::swap(&mut tmp, &mut val);
+                        v.push(tmp);
+                    },
+                    _ => {
+                        let mut tmp = Val::void();
+                        ::std::mem::swap(&mut tmp, old_val);
+                        let mut new = Val::void();
+                        ::std::mem::swap(&mut new, &mut val);
+                        *old_val = Val::Tup(vec![tmp, new]);
+                    },
+                },
+                Prefix => match old_val {
+                    &mut Val::Tup(ref mut v) => {
+                        let mut tmp = Val::void();
+                        ::std::mem::swap(&mut tmp, &mut val);
+                        v.insert(0, tmp);
+                    },
+                    _ => {
+                        let mut tmp = Val::void();
+                        ::std::mem::swap(&mut tmp, old_val);
+                        let mut new = Val::void();
+                        ::std::mem::swap(&mut new, &mut val);
+                        *old_val = Val::Tup(vec![new, tmp]);
+                    },
+                },
+            }
+        }) {
+            Ok(..) => Val::void(),
+            Err(e) => e,
+        }
+    }
+
     pub fn exec_stmt(&self, stmt_s: &ExprS, local_vars: &mut LocalVars) -> (Val, Control) {
         let &ExprS(ref stmt, span) = stmt_s;
         match *stmt {
@@ -943,31 +816,7 @@ impl Interp {
                 }
                 val.0.eval();
                 //println!("Bind {:?} to {:?}", n, val);
-                match &**n {
-                    &ExprS(Expr::Ident(ref id), _) => {
-                        Self::do_set(op, id, Indexing::NoIndex, val.0, local_vars);
-                    },
-                    &ExprS(Expr::Index(_, box ExprS(ref id, _), ref index), _) => {
-                        if let Some(id) = id.get_ident() {
-                            let (index, con) = self.from_expr(&*index, local_vars);
-                            return index.with_val(move |index| {
-                                if con.stops_exec() {
-                                    return (Val::void(), con);
-                                }
-                                match Indexing::from_val(&index) {
-                                    Ok(index) => Self::do_set(op, id, index, val.0, local_vars),
-                                    Err(err) => return (err, Control::Done),
-                                };
-                                (Val::void(), Control::Done)
-                            })
-                        } else {
-                            panic!("Left-hand-side of indexing not an identifier")
-                        }
-                    },
-                    _ =>
-                        panic!("Left-hand-side of assignment not an identifier"),
-                }
-                (Val::void(), Control::Done)
+                (self.do_set(op, &**n, val.0, local_vars), Control::Done)
             },
             Expr::Import(scope, ref name, ref rename, ref assign) => {
                 if let Some(name) = name.get_ident() {

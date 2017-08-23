@@ -3,7 +3,6 @@
 #![feature(inclusive_range_syntax)]
 #![feature(box_patterns)]
 #![feature(splice)]
-#![feature(slice_get_slice)]
 
 //extern crate regex;
 
@@ -41,7 +40,6 @@ pub mod util {
     use rush_rt::range::RangeExt;
     use std::process::Command;
     use rush_rt::val::{Val, ValIterOps, InternalIterable};
-    use rush_rt::error::RuntimeError;
     use self::Val::*;
     use std::borrow::{Cow};
     use interp::Jobs;
@@ -92,136 +90,6 @@ pub mod util {
             println!("{:?}", val.iter().next().unwrap());
         } else {
             println!("{:?}", val);
-        }
-    }
-
-    pub fn list_dict_keys(val: &Val) -> Vec<String> {
-        let mut ret = vec![];
-        Cow::from(val).for_each_shallow(&mut |val: Cow<Val>| {
-            match *(val.as_ref()) {
-                Tup(ref v) if v.len() == 2 => {
-                    if let Some(key) = v[0].get_string() {
-                        ret.push(key);
-                    }
-                },
-                _ => {},
-            }
-            return true;
-        });
-        ret
-    }
-
-    pub fn list_dict_values(val: &Val) -> Vec<Val> {
-        let mut ret = vec![];
-        Cow::from(val).for_each_shallow(&mut |val: Cow<Val>| {
-            match *(val.as_ref()) {
-                Tup(ref v) if v.len() == 2 => {
-                    if let Val::Str(_) = v[0] {
-                        ret.push(v[1].clone());
-                    }
-                },
-                _ => {},
-            }
-            return true;
-        });
-        ret
-    }
-
-    fn wrap_index(i: i64, len: usize) -> usize {
-        if i < 0 {
-            len - (-i as usize)
-        } else {
-            i as usize
-        }
-    }
-
-    pub fn index_str(val: &Val, i: &str) -> Val {
-        let mut ret = None;
-        Cow::from(val).for_each_shallow(&mut |val: Cow<Val>| {
-            match *(val.as_ref()) {
-                Tup(ref v) if v.len() == 2 && v[0].get_string().map_or(false, |x| x == i) => {
-                    ret = Some(v[1].clone()); return false
-                },
-                _ => {},
-            }
-            return true;
-        });
-        ret.unwrap_or_else(||
-            Val::err(RuntimeError::KeyNotFound{keys: list_dict_keys(val), idx: i.into()}, None))
-    }
-
-    pub fn index_int(val: &Val, idx: i64) -> Val {
-        match val {
-            &Ref(ref r) => return index_int(&*r.get_ref(), idx),
-            &Tup(ref v) => {
-                let i = wrap_index(idx, v.len());
-                if i >= v.len() {
-                    return Val::err(RuntimeError::IndexOutOfRange{len: v.len(), idx}, None);
-                }
-                let ret = &v[i];
-                return ret.clone();
-            },
-            &Error(ref e) => {
-                e.1.set(true);
-                let i = wrap_index(idx, e.0.len() + 1);
-                if i == 0 { return Val::str("Err!"); }
-                if i - 1 < e.0.len() {
-                    let ret = &e.0[i - 1];
-                    return ret.clone();
-                }
-                return Val::err(RuntimeError::IndexOutOfRange{len: e.0.len() + 1, idx}, None);
-            }
-            _ => if idx == 0 || idx == -1 { return val.clone(); } else {
-                return Val::err(RuntimeError::IndexOutOfRange{len: 1, idx}, None);
-            },
-        }
-    }
-
-    use std::slice::SliceIndex;
-
-    fn index_slice<S: SliceIndex<[Val], Output = [Val]> + ::std::fmt::Debug>(val: &Val, s: S) -> Val {
-        match val {
-            &Tup(ref v) => {
-                match v.get(s) {
-                    Some(v) => Val::Tup(v.iter().cloned().collect()),
-                    None => Val::err_str("Bad index slice"),
-                }
-            },
-            _ => Val::err_str("Bad index slice"),
-        }
-    }
-
-    pub fn index_range(val: &Val, r: Range) -> Val {
-        match *val {
-            Ref(ref rf) => return index_range(&*rf.get_ref(), r),
-            Error(ref e) => {
-                let mut v = Vec::with_capacity(1 + e.0.len());
-                v.push(Val::str("Err!"));
-                v.extend_from_slice(&e.0[..]);
-                return index_range(&Tup(v), r);
-            },
-            Tup(ref v) => {
-                match r {
-                    Range::All => return val.clone(),
-                    Range::FromInt(l) => index_slice(val, wrap_index(l, v.len())..),
-                    Range::TillInt(r) => index_slice(val, ...wrap_index(r, v.len())),
-                    Range::WithinInt(l, r) => index_slice(val, wrap_index(l, v.len())...wrap_index(r, v.len())),
-                    _ => Val::err(RuntimeError::InvalidIndex(Box::new(r.as_val()), "Index must be a scalar or non-negative integer range"), None)
-                }
-            },
-            _ => unimplemented!(),
-        }
-    }
-
-    use interp::Indexing;
-
-    pub fn index(val: &Val, i: Indexing) -> Val {
-        use self::Indexing::*;
-        match i {
-            NoIndex => unreachable!(),
-            Offset(o) => index_int(val, o),
-            Dict(k) => index_str(val, k),
-            Indexing::Range(r) => index_range(val, r),
         }
     }
 
@@ -416,14 +284,22 @@ mod builtins {
         args
     }
 
-    use interp::Indexing;
-
     pub fn index(_: &Interp, locs: &mut LocalVars) -> Val
     {
         let tup = locs.get("tup").unwrap().get();
         let i = locs.get("i").unwrap().get();
+        println!("Indexing {:?}", tup);
+        use rush_rt::val::Indexing;
         match Indexing::from_val(&i) {
-            Ok(index) => util::index(&tup, index),
+            Ok(index) => {
+                let mut ret = None;
+                if let Err(e) = tup.with_index(&index, &mut |val| {
+                    ret = Some(val.clone());
+                }) {
+                    return e;
+                }
+                return ret.unwrap();
+            }
             Err(err) => return err,
         }
         /*
@@ -515,7 +391,7 @@ mod builtins {
     {
         let args = locs.get("args").unwrap().get_ref();
         //println!("args: {:?}", args);
-        let ret = util::list_dict_keys(get_tup_dict(&*args));
+        let ret = get_tup_dict(&*args).list_dict_keys();
         ret.into()
     }
 
@@ -523,7 +399,7 @@ mod builtins {
     {
         let args = locs.get("args").unwrap().get_ref();
         //println!("args: {:?}", args);
-        let ret = util::list_dict_values(get_tup_dict(&*args));
+        let ret = get_tup_dict(&*args).list_dict_values();
         ret.into()
     }
 

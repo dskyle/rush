@@ -255,6 +255,38 @@ pub fn escape_rush_string(s: &str) -> String {
     unsafe { String::from_utf8_unchecked(bytes) }
 }
 
+#[derive(Debug)]
+pub enum Indexing<'a> {
+    Offset(i64),
+    Dict(&'a str),
+    Range(Range),
+}
+
+impl<'a> Indexing<'a> {
+    pub fn from_val(val: &'a Val) -> Result<Indexing, Val> {
+        if let Some(i) = val.get_str() {
+            if let Ok(i) = str::parse::<i64>(i) {
+                Ok(Indexing::Offset(i))
+            } else {
+                Ok(Indexing::Dict(i))
+            }
+        } else if let Ok(rng) = Range::from_val(val) {
+            Ok(Indexing::Range(rng))
+        } else {
+            Err(Val::err(RuntimeError::InvalidIndex(val.clone().into(),
+                         "Index must be a scalar or range"), None))
+        }
+    }
+}
+
+pub fn wrap_index(i: i64, len: usize) -> usize {
+    if i < 0 {
+        len - (-i as usize)
+    } else {
+        i as usize
+    }
+}
+
 impl Val {
     pub fn str<S: Into<String>>(s: S) -> Val {
         Val::Str(s.into())
@@ -472,12 +504,21 @@ impl Val {
         }
     }
 
-    pub fn take_str(self) -> Option<String> {
-        if let Val::Str(s) = self {
-            Some(s)
-        } else {
-            None
-        }
+    pub fn take_str(mut self) -> Result<String, Val> {
+        match self {
+            Val::Str(ref s) => return Ok(s.clone()),
+            Val::Ref(ref r) => match r.get_ref().get_string() {
+                Some(s) => return Ok(s),
+                None => {},
+            },
+            Val::Tup(ref mut t) if t.len() == 1 => {
+                let mut tmp = Val::void();
+                ::std::mem::swap(&mut tmp, &mut t[0]);
+                return tmp.take_str()
+            },
+            _ => {},
+        };
+        Err(self)
     }
 
     pub fn get_tup(&self) -> Option<&Vec<Val>> {
@@ -657,6 +698,323 @@ impl Val {
             }
         }
         Val::Tup(pairs)
+    }
+
+    pub fn list_dict_keys(&self) -> Vec<String> {
+        let mut ret = vec![];
+        Cow::from(self).for_each_shallow(&mut |val: Cow<Val>| {
+            match *(val.as_ref()) {
+                Val::Tup(ref v) if v.len() == 2 => {
+                    if let Some(key) = v[0].get_string() {
+                        ret.push(key);
+                    }
+                },
+                _ => {},
+            }
+            return true;
+        });
+        ret
+    }
+
+    pub fn list_dict_values(&self) -> Vec<Val> {
+        let mut ret = vec![];
+        Cow::from(self).for_each_shallow(&mut |val: Cow<Val>| {
+            match *(val.as_ref()) {
+                Val::Tup(ref v) if v.len() == 2 => {
+                    if let Val::Str(_) = v[0] {
+                        ret.push(v[1].clone());
+                    }
+                },
+                _ => {},
+            }
+            return true;
+        });
+        ret
+    }
+
+    pub fn with_index<'a, F>(&self, i: &Indexing<'a>, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
+        use self::Val::*;
+
+        fn index_str<F>(val: &Val, i: &str, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
+            let mut found = false;
+            Cow::from(val).for_each_shallow(&mut |val: Cow<Val>| {
+                match *(val.as_ref()) {
+                    Tup(ref v) if v.len() == 2 && v[0].get_string().map_or(false, |x| x == i) => {
+                        found = true;
+                        f(&v[1]);
+                        return false
+                    },
+                    _ => {},
+                }
+                return true;
+            });
+            if found {
+                Ok(())
+            } else {
+                Err(Val::err(RuntimeError::KeyNotFound{keys: val.list_dict_keys(), idx: i.into()}, None))
+            }
+        }
+
+        fn index_int<F>(val: &Val, idx: i64, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
+            match val {
+                &Ref(ref r) => return index_int(&*r.get_ref(), idx, f),
+                &Tup(ref v) => {
+                    let i = wrap_index(idx, v.len());
+                    if i >= v.len() {
+                        return Err(Val::err(RuntimeError::IndexOutOfRange{len: v.len(), idx}, None));
+                    }
+                    f(&v[i]);
+                    return Ok(());
+                },
+                &Error(ref e) => {
+                    e.1.set(true);
+                    let i = wrap_index(idx, e.0.len() + 1);
+                    if i == 0 { f(&Val::str("Err!")); return Ok(()) }
+                    if i - 1 < e.0.len() {
+                        f(&e.0[i - 1]);
+                        return Ok(());
+                    }
+                    return Err(Val::err(RuntimeError::IndexOutOfRange{len: e.0.len() + 1, idx}, None));
+                }
+                _ => if idx == 0 || idx == -1 { f(val); return Ok(()); } else {
+                    return Err(Val::err(RuntimeError::IndexOutOfRange{len: 1, idx}, None));
+                },
+            }
+        }
+
+        use std::slice::SliceIndex;
+
+        fn index_slice<F, S: SliceIndex<[Val], Output = [Val]> + ::std::fmt::Debug>(val: &Val, s: S, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
+            match val {
+                &Tup(ref v) => {
+                    match v.get(s) {
+                        Some(v) => {
+                            f(&Val::Tup(v.iter().cloned().collect()));
+                            return Ok(())
+                        },
+                        None => Err(Val::err_str("Bad index slice")),
+                    }
+                },
+                _ => Err(Val::err_str("Bad index slice")),
+            }
+        }
+
+        fn index_range<F>(val: &Val, r: &Range, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
+            match *val {
+                Ref(ref rf) => return index_range(&*rf.get_ref(), r, f),
+                Error(ref e) => {
+                    let mut v = Vec::with_capacity(1 + e.0.len());
+                    v.push(Val::str("Err!"));
+                    v.extend_from_slice(&e.0[..]);
+                    return index_range(&Tup(v), r, f);
+                },
+                Tup(ref v) => {
+                    match *r {
+                        Range::All => { f(val); return Ok(()) },
+                        Range::FromInt(l) => index_slice(val, wrap_index(l, v.len()).., f),
+                        Range::TillInt(r) => index_slice(val, ...wrap_index(r, v.len()), f),
+                        Range::WithinInt(l, r) => index_slice(val, wrap_index(l, v.len())...wrap_index(r, v.len()), f),
+                        _ => Err(Val::err(RuntimeError::InvalidIndex(Box::new(r.as_val()), "Index must be a scalar or non-negative integer range"), None))
+                    }
+                },
+                _ => unimplemented!(),
+            }
+        }
+
+        match *i {
+            Indexing::Offset(o) => index_int(self, o, f),
+            Indexing::Dict(k) => index_str(self, k, f),
+            Indexing::Range(ref r) => index_range(self, r, f),
+        }
+    }
+
+    pub fn tuplefy(&mut self) {
+        if let Val::Str(..) = *self {
+            let mut tmp = Val::void();
+            ::std::mem::swap(&mut tmp, self);
+            *self = Val::Tup(vec![tmp]);
+        }
+    }
+
+    pub fn with_index_mut<'a, F>(&mut self, i: &Indexing<'a>, f: &mut F) -> Result<(), Val> where F: (FnMut(&mut Val) -> ()) {
+        use self::Val::*;
+
+        fn index_int<F>(val: &mut Val, idx: i64, f: &mut F) -> Result<(), Val> where F: (FnMut(&mut Val) -> ()) {
+            match *val {
+                Ref(ref mut r) => return index_int(&mut *r.get_mut(), idx, f),
+                Tup(ref mut v) => {
+                    if idx >= 0 {
+                        let idx = idx as usize;
+                        if v.len() <= idx {
+                            v.resize(idx + 1, Val::void())
+                        }
+                        //v[index] = val;
+                        f(&mut v[idx])
+                    } else {
+                        let idx = v.len() as i64 + idx;
+                        if idx < 0 {
+                            v.splice(0..0, ::std::iter::repeat(Val::void()).take(-idx as usize));
+                            f(&mut v[0])
+                        } else {
+                            f(&mut v[idx as usize])
+                        }
+                    }
+                    return Ok(());
+                },
+                Error(ref mut e) => {
+                    if let Some(e) = Rc::get_mut(e) {
+                        e.1.set(true);
+                        let i = wrap_index(idx, e.0.len() + 1);
+                        if i == 0 {
+                            let mut val = Val::str("Err!");
+                            f(&mut val);
+                            return Ok(())
+                        }
+                        if i - 1 < e.0.len() {
+                            f(&mut e.0[i - 1]);
+                            return Ok(());
+                        }
+                        return Err(Val::err(RuntimeError::IndexOutOfRange{len: e.0.len() + 1, idx}, None));
+                    } else {
+                        return Err(Val::err_str("Tried to modify shared error value"));
+                    }
+                }
+                _ => if idx == 0 || idx == -1 { f(val); return Ok(()); } else {
+                    let mut tmp = Val::void();
+                    ::std::mem::swap(&mut tmp, val);
+                    *val = Val::Tup(vec![tmp]);
+                    return index_int(val, idx, f);
+                },
+            }
+        }
+
+        fn index_str<F>(val: &mut Val, i: &str, f: &mut F) -> Result<(), Val> where F: (FnMut(&mut Val) -> ()) {
+            let mut found = false;
+            for_each_shallow_mut(val, &mut |val: &mut Val| {
+                match *val {
+                    Tup(ref mut v) if v.len() == 2 && v[0].get_string().map_or(false, |x| x == i) => {
+                        found = true;
+                        f(&mut v[1]);
+                        return false
+                    },
+                    _ => {},
+                }
+                return true;
+            });
+            if found {
+                Ok(())
+            } else {
+                val.tuplefy();
+                if let Some(v) = val.get_tup_mut() {
+                    let mut tmp = Val::void();
+                    f(&mut tmp);
+                    v.push(Val::Tup(vec![Val::str(i), tmp]));
+                    return Ok(());
+                }
+                Err(Val::err(RuntimeError::KeyNotFound{keys: val.list_dict_keys(), idx: i.into()}, None))
+            }
+        }
+
+        /*
+        use std::slice::SliceIndex;
+
+        fn index_slice<F, S: SliceIndex<[Val], Output = [Val]> + ::std::fmt::Debug>(val: &mut Val, s: S, f: &mut F) -> Result<(), Val> where F: (FnMut(&mut Val) -> ()) {
+            match val {
+                &Tup(ref v) => {
+                    match v.get(s) {
+                        Some(v) => {
+                            f(&Val::Tup(v.iter().cloned().collect()));
+                            return Ok(())
+                        },
+                        None => Err(Val::err_str("Bad index slice")),
+                    }
+                },
+                _ => Err(Val::err_str("Bad index slice")),
+            }
+        }
+        */
+
+        fn index_range<F>(val: &mut Val, r: &Range, f: &mut F) -> Result<(), Val> where F: (FnMut(&mut Val) -> ()) {
+            fn wrap_index_i64(index: i64, len: usize) -> i64 {
+                if index >= 0 {
+                    index
+                } else {
+                    len as i64 + index
+                }
+            }
+
+            let val_into_iter = |val| {
+                let iter = match val {
+                    Val::Tup(val) => val.into_iter(),
+                    Val::Ref(_) => vec!(Val::Embed(Box::new(val))).into_iter(),
+                    _ => vec!(val).into_iter(),
+                };
+                iter
+            };
+
+            match *val {
+                Val::Tup(ref mut cur) => {
+                    let n = cur.len() as i64;
+
+                    let (l, r) = match *r {
+                        Range::WithinInt(l, r) => (l, r),
+                        Range::FromInt(l) => (l, n - 1),
+                        Range::TillInt(r) => (0, r),
+                        _ => return Err(Val::str(format!("Invalid range index for setting: {:?}", r))),
+                    };
+
+                    let l = wrap_index_i64(l, n as usize);
+                    let r = wrap_index_i64(r, n as usize);
+                    let mut val = Val::void();
+                    f(&mut val);
+                    let iter = val_into_iter(val);
+                    use std::iter::repeat;
+                    if l < 0 {
+                        if r < 0 {
+                            let iter = iter.chain(repeat(Val::void()).take((-r - 1) as usize));
+                            cur.splice(0..0, iter);
+                        } else if r < n {
+                            cur.splice(0...r as usize, iter);
+                        } else {
+                            *cur = iter.collect();
+                        }
+                    } else if l < n {
+                        if r < n {
+                            cur.splice(l as usize...r as usize, iter);
+                        } else {
+                            cur.splice(l as usize..n as usize, iter);
+                        }
+                    } else {
+                        let iter = repeat(Val::void()).take((l - n) as usize).chain(iter);
+                        cur.splice(n as usize..n as usize, iter);
+                    }
+                    Ok(())
+                },
+                _ => {
+                    unimplemented!();
+                }
+            }
+        }
+
+        match *i {
+            Indexing::Offset(o) => index_int(self, o, f),
+            Indexing::Dict(k) => index_str(self, k, f),
+            Indexing::Range(ref r) => index_range(self, r, f),
+        }
+    }
+}
+
+fn new_vec_init<T: Clone>(index: i64, def: T, orig_val: T) -> Vec<T> {
+    if index >= 0 {
+        let index = index as usize;
+        let mut ret = vec![def; index + 1];
+        ret[0] = orig_val;
+        ret
+    } else {
+        let len = -index as usize;
+        let mut ret = vec![def; len];
+        ret[len - 1] = orig_val;
+        ret
     }
 }
 
@@ -1001,4 +1359,53 @@ impl<'a> From<&'a Regex> for Val {
 
         Tup(vec![Val::str("Regex"), Val::str(f.as_str())])
     }
+}
+
+fn for_each_shallow_mut<'a, F>(this: &'a mut Val, f: &mut F) -> bool where F: (FnMut(&mut Val) -> bool) {
+    fn imp<'a, F>(this: &'a mut Val, f: &mut F, depth: Depth) -> bool where F: (FnMut(&mut Val) -> bool) {
+        use self::Val::*;
+        use std::ops::DerefMut;
+        use std::rc::Rc;
+
+        match *this {
+            Str(_) => { return f(this); },
+            Tup(_) => {
+                if depth.dep() > 0 {
+                    return f(this)
+                } else {
+                    for x in this.get_tup_mut().unwrap() {
+                        if !imp(x, f, depth.inc()) { return false }
+                    }
+                }
+                return true;
+            },
+            Embed(ref mut e) => {
+                return imp(e, f, depth.embed());
+            },
+            Ref(ref r) => {
+                let vref = r.clone();
+                let mut r = vref.get_mut();
+                return imp(r.deref_mut(), f, depth.enter_ref());
+            },
+            Error(ref mut e) => {
+                if let Some(e) = Rc::get_mut(e) {
+                    e.1.set(true);
+                    let depth = depth.inc();
+                    let mut first = Val::str("Err!");
+                    f(&mut first);
+                    if first.get_str() != Some("Err!") {
+                        unimplemented!();
+                    }
+                    let tup = &mut e.0;
+                    for x in tup.iter_mut() {
+                        if !imp(x, f, depth) { return false }
+                    }
+                    return true;
+                } else {
+                    return true;
+                }
+            },
+        };
+    };
+    return imp(this, f, Depth::default())
 }
