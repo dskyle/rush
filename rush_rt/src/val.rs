@@ -1,6 +1,5 @@
 use vars::VarRef;
 use rush_parser::ast::{Span, SubsMode};
-use std::ops::Deref;
 use std::ascii::AsciiExt;
 use std::fmt::{Display, Formatter, Error};
 use std::convert::From;
@@ -115,7 +114,7 @@ impl Display for Val {
                 write!(f, ")")?;
             },
             Str(ref s) => write!(f, "{}", s)?,
-            Ref(ref r) => return r.get_ref().fmt(f),
+            Ref(ref r) => return r.with_ref(|x| x.fmt(f)),
             Embed(ref e) => return e.fmt(f),
             Error(ref r) => {
                 let (ref e, _, ref span) = **r;
@@ -173,24 +172,11 @@ impl<'a, T: Clone + Iterator<Item = &'a Val>> ValIterOps for T {
 
         match self.next() {
             Some(&Tup(ref v)) => v.iter().fold(0, |acc, x| acc + x.iter().flat_len()),
-            Some(&Ref(ref r)) => r.get_ref().iter().flat_len(),
+            Some(&Ref(ref r)) => r.with_ref(|x| x.iter().flat_len()),
             Some(_) => 1,
             None => 0,
         }
     }
-
-    /*
-    fn flatten_impl(mut self, v: &mut Vec<Val>) {
-        use self::Val::*;
-
-        while let Some(val) = self.next() {
-            match val {
-                &Tup(ref t) => val.iter().flatten_impl(v),
-                &Ref(ref r) => r.get_ref().iter().flatten_impl(v),
-                x => v.push(x.clone()),
-            }
-        }
-    }*/
 
     fn flatten(self) -> Val {
         use self::Val::*;
@@ -199,7 +185,7 @@ impl<'a, T: Clone + Iterator<Item = &'a Val>> ValIterOps for T {
             while let Some(val) = this.next() {
                 match val {
                     &Tup(ref t) => imp(t.iter(), v),
-                    &Ref(ref r) => imp(r.get_ref().iter(), v),
+                    &Ref(ref r) => r.with_ref(|x| imp(x.iter(), v)),
                     x => v.push(x.clone()),
                 }
             }
@@ -352,7 +338,7 @@ impl Val {
         use self::Val::*;
 
         match *self {
-            Ref(ref r) => r.get_ref().with_val(f),
+            Ref(ref r) => r.with_ref(|x| x.with_val(f)),
             _ => f(self),
         }
     }
@@ -361,7 +347,7 @@ impl Val {
         use self::Val::*;
 
         match self {
-            Ref(ref r) => r.get_ref().with_val(|val| f(val.into())),
+            Ref(ref r) => r.with_ref(|x| x.with_val(|val| f(val.into()))),
             _ => f(self.into()),
         }
     }
@@ -489,7 +475,7 @@ impl Val {
     pub fn get_cowstr(&self) -> Option<Cow<str>> {
         match *self {
             Val::Str(ref s) => Some(Borrowed(s)),
-            Val::Ref(ref r) => r.get_ref().get_string().map(|x| { Owned(x) }),
+            Val::Ref(ref r) => r.with_ref(|x| x.get_string().map(|x| { Owned(x) })),
             Val::Tup(ref t) if t.len() == 1 => t[0].get_cowstr(),
             _ => None,
         }
@@ -498,7 +484,7 @@ impl Val {
     pub fn get_string(&self) -> Option<String> {
         match *self {
             Val::Str(ref s) => Some(s.clone()),
-            Val::Ref(ref r) => r.get_ref().get_string(),
+            Val::Ref(ref r) => r.with_ref(|x| x.get_string()),
             Val::Tup(ref t) if t.len() == 1 => t[0].get_string(),
             _ => None,
         }
@@ -507,7 +493,7 @@ impl Val {
     pub fn take_str(mut self) -> Result<String, Val> {
         match self {
             Val::Str(ref s) => return Ok(s.clone()),
-            Val::Ref(ref r) => match r.get_ref().get_string() {
+            Val::Ref(ref r) => match r.with_ref(|x| x.get_string()) {
                 Some(s) => return Ok(s),
                 None => {},
             },
@@ -668,6 +654,21 @@ impl Val {
         Val::Tup(ret)
     }
 
+    pub fn flat_join(self, delim: Option<char>) -> Val {
+        let mut ret = String::new();
+        Cow::from(self).for_each(&mut |s: Cow<str>, _| {
+            if let Some(delim) = delim {
+                if ret.len() > 0 {
+                    ret.push(delim);
+                }
+            }
+            use std::borrow::Borrow;
+            ret.push_str(s.borrow());
+            true
+        });
+        Val::Str(ret)
+    }
+
     pub fn subst(mut self, m: SubsMode) -> Val {
         if m.is_flatten() {
             self = self.flatten()
@@ -757,7 +758,7 @@ impl Val {
 
         fn index_int<F>(val: &Val, idx: i64, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
             match val {
-                &Ref(ref r) => return index_int(&*r.get_ref(), idx, f),
+                &Ref(ref r) => return r.with_ref(|x| index_int(x, idx, f)),
                 &Tup(ref v) => {
                     let i = wrap_index(idx, v.len());
                     if i >= v.len() {
@@ -801,7 +802,7 @@ impl Val {
 
         fn index_range<F>(val: &Val, r: &Range, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
             match *val {
-                Ref(ref rf) => return index_range(&*rf.get_ref(), r, f),
+                Ref(ref rf) => return rf.with_ref(|x| index_range(x, r, f)),
                 Error(ref e) => {
                     let mut v = Vec::with_capacity(1 + e.0.len());
                     v.push(Val::str("Err!"));
@@ -841,7 +842,7 @@ impl Val {
 
         fn index_int<F>(val: &mut Val, idx: i64, f: &mut F) -> Result<(), Val> where F: (FnMut(&mut Val) -> ()) {
             match *val {
-                Ref(ref mut r) => return index_int(&mut *r.get_mut(), idx, f),
+                Ref(ref mut r) => return r.with_mut(|x| index_int(x, idx, f)),
                 Tup(ref mut v) => {
                     if idx >= 0 {
                         let idx = idx as usize;
@@ -1004,20 +1005,6 @@ impl Val {
     }
 }
 
-fn new_vec_init<T: Clone>(index: i64, def: T, orig_val: T) -> Vec<T> {
-    if index >= 0 {
-        let index = index as usize;
-        let mut ret = vec![def; index + 1];
-        ret[0] = orig_val;
-        ret
-    } else {
-        let len = -index as usize;
-        let mut ret = vec![def; len];
-        ret[len - 1] = orig_val;
-        ret
-    }
-}
-
 impl From<bool> for Val {
     fn from(b: bool) -> Val {
         if b {
@@ -1132,13 +1119,11 @@ impl<'a> InternalIterable for Cow<'a, Val> {
                     return imp(Borrowed(&*e), f, depth.embed());
                 },
                 Owned(Ref(r)) => {
-                    let r = r.get_ref();
-                    return imp(Borrowed(r.deref()), f, depth.enter_ref());
+                    return r.with_ref(|x| imp(Borrowed(x), f, depth.enter_ref()));
                 },
                 Borrowed(&Ref(ref r)) => {
                     let vref = r.clone();
-                    let r = vref.get_ref();
-                    return imp(Borrowed(r.deref()), f, depth.enter_ref());
+                    return vref.with_ref(|x| imp(Borrowed(x), f, depth.enter_ref()));
                 },
                 Owned(Error(ref e)) | Borrowed(&Error(ref e)) => {
                     e.1.set(true);
@@ -1182,13 +1167,10 @@ impl<'a> InternalIterable for Cow<'a, Val> {
                     return imp(Borrowed(&*e), f, depth, flatten + 1);
                 },
                 Owned(Ref(r)) => {
-                    let r = r.get_ref();
-                    return imp(Borrowed(r.deref()), f, depth, flatten);
+                    return r.with_ref(|x| imp(Borrowed(x), f, depth, flatten));
                 },
                 Borrowed(&Ref(ref r)) => {
-                    let vref = r.clone();
-                    let r = vref.get_ref();
-                    return imp(Borrowed(r.deref()), f, depth, flatten);
+                    return r.with_ref(|x| imp(Borrowed(x), f, depth, flatten));
                 },
                 Owned(Error(ref e)) | Borrowed(&Error(ref e)) => {
                     e.1.set(true);
@@ -1212,18 +1194,18 @@ impl<'a> InternalIterable for Cow<'a, Val> {
                 //println!("{} {}  {:?} {:?}  {:?}  {:?}", l_len, r_len, dl, dr, il.peek(), ir.peek());
                 match (il.peek(), ir.peek()) {
                     (Some(&&Ref(ref r)), _) => {
-                        let r = r.get_ref();
-                        let mut iter = vec![&*r].into_iter().peekable();
-                        if !imp(&mut iter, ir, f, dl.enter_ref(), dr) { return false; }
+                        if !r.with_ref(|x| {
+                            let mut iter = vec![x].into_iter().peekable();
+                            imp(&mut iter, ir, f, dl.enter_ref(), dr) }) { return false; }
 
                         il.next();
 
                         //println!("Ref Left next {:?}", il.next());
                     },
                     (_, Some(&&Ref(ref r))) => {
-                        let r = r.get_ref();
-                        let mut iter = vec![&*r].into_iter().peekable();
-                        if !imp(il, &mut iter, f, dl, dr.enter_ref()) { return false; }
+                        if !r.with_ref(|x| {
+                            let mut iter = vec![x].into_iter().peekable();
+                            imp(&mut iter, ir, f, dl, dr.enter_ref()) }) { return false; }
 
                         ir.next();
 
@@ -1364,7 +1346,6 @@ impl<'a> From<&'a Regex> for Val {
 fn for_each_shallow_mut<'a, F>(this: &'a mut Val, f: &mut F) -> bool where F: (FnMut(&mut Val) -> bool) {
     fn imp<'a, F>(this: &'a mut Val, f: &mut F, depth: Depth) -> bool where F: (FnMut(&mut Val) -> bool) {
         use self::Val::*;
-        use std::ops::DerefMut;
         use std::rc::Rc;
 
         match *this {
@@ -1384,8 +1365,7 @@ fn for_each_shallow_mut<'a, F>(this: &'a mut Val, f: &mut F) -> bool where F: (F
             },
             Ref(ref r) => {
                 let vref = r.clone();
-                let mut r = vref.get_mut();
-                return imp(r.deref_mut(), f, depth.enter_ref());
+                return vref.with_mut(|x| imp(x, f, depth.enter_ref()));
             },
             Error(ref mut e) => {
                 if let Some(e) = Rc::get_mut(e) {

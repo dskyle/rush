@@ -63,8 +63,7 @@ fn process_embed_check<'a, PIter: Clone + Iterator<Item = &'a Pat>>(
         },
         &Val::Ref(ref r) => {
             //println!("In Embed::Tup::Ref: {:?}", r);
-            let r = &*r.get_ref();
-            return process_embed_check(this, piter, l, r, depth);
+            return r.with_ref(|x| process_embed_check(this, piter, l, x, depth));
         },
         x => return (piter, l.subsumes(x) == Subsumption::Contains),
     }
@@ -130,22 +129,23 @@ fn bind_refs_none(this: &Pat, b: &mut LocalVars) {
     }
 }
 
-fn do_binding<T: Into<String> + AsRef<str>>(name: T, val: Cow<Val>, b: &mut LocalVars, wrap_some: bool) {
+fn do_binding<T: Into<String> + AsRef<str> + ::std::fmt::Debug>(name: T, val: Cow<Val>, b: &mut LocalVars, wrap_some: bool) {
     if name.as_ref() == "_" {
         //println!("Ignore {:?}", val);
     } else {
         let mut val = val.into_owned();
         val.simplify_shallow();
         if wrap_some {
-            //println!("Bind optional {:?} to Some({:?})", name, val);
+            //println!("Bind optional {:?} to ({:?})", name, val);
             let var = b.get(name.as_ref()).expect("Variable should already exist in optional arg binding");
-            let mut v = var.get_mut();
-            if let Val::Tup(ref mut v) = *v {
-                //println!("Existing tuple: {:?}", v);
-                v.push(val);
-            } else {
-                unreachable!();
-            }
+            var.with_mut(|x| {
+                if let Val::Tup(ref mut v) = *x {
+                    //println!("Existing tuple: {:?}", v);
+                    v.push(val);
+                } else {
+                    unreachable!();
+                }
+            });
             //b.bind(name, Val::Tup(vec![Val::str("Some"), val]));
         } else {
             //println!("Bind {:?} to {:?}", name, val);
@@ -182,12 +182,10 @@ fn process_embed_matches<'a, PIter: Clone + Iterator<Item = &'a Pat>>(
             return (true, process_tup_matches(this, piter, niter, b, wrap_some));
         },
         Borrowed(&Val::Ref(ref r)) => {
-            let r = &*r.get_ref();
-            return process_embed_matches(this, piter, l, Borrowed(r), b, wrap_some);
+            return r.with_ref(|x| process_embed_matches(this, piter, l, Borrowed(x), b, wrap_some));
         },
         Owned(Val::Ref(r)) => {
-            let r = &*r.get_ref();
-            return process_embed_matches(this, piter, l, Borrowed(r), b, wrap_some);
+            return r.with_ref(|x| process_embed_matches(this, piter, l, Borrowed(x), b, wrap_some));
         },
         x => { do_match_impl(l, x, b, wrap_some); return (false, piter) },
     }
@@ -287,7 +285,7 @@ fn do_match_impl(this: &Pat, val: Cow<Val>, b: &mut LocalVars, wrap_some: bool) 
                     }
                 },
                 Owned(Val::Ref(ref r)) | Borrowed(&Val::Ref(ref r)) => {
-                    do_match_impl(this, (&*r.get_ref()).into(), b, wrap_some);
+                    r.with_ref(|x| do_match_impl(this, Borrowed(x), b, wrap_some));
                 },
                 _ => {}
             },
@@ -336,7 +334,7 @@ impl Subsumes<Val> for Pat {
         match (self, val) {
             (&Wild(..), _) => Contains,
             (&ID(_), _) => Contains,
-            (_, &Val::Ref(ref var)) => self.subsumes(&*var.get_ref()),
+            (_, &Val::Ref(ref var)) => var.with_ref(|x| self.subsumes(x)),
             (_, &Val::Embed(ref val)) => self.subsumes(&**val),
             (&Tup(ref pt), &Val::Tup(ref vt)) => {
                 let piter = pt.iter();

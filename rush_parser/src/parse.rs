@@ -48,7 +48,7 @@ parser! {
     }
 
     stmt_list: Res<Vec<ExprS>> {
-        stmt[s] => {
+        nl stmt[s] => {
             let s = s?;
             if s.0 == Expr::Nop {
                 Ok(vec!())
@@ -147,7 +147,7 @@ parser! {
 
     ws_tuple_val: Res<ExprS> {
         #[no_reduce(Range, Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare,
-                    Read, Recv, If, While, For, Match, MatchAll, LBracePipe, LambdaOpen)]
+                    Read, Recv, If, While, For, Match, MatchAll, LambdaOpen)]
         ws_tuple[tup] => {
             let mut tup = tup?;
             if tup.len() == 1 {
@@ -192,8 +192,6 @@ parser! {
     }
 
     val: Res<ExprS> {
-        var_ref[vr] ws => vr,
-        exec[ex] ws => ex,
         parens[p] ws => p,
     }
 
@@ -222,8 +220,8 @@ parser! {
     }
 
     double_string: Res<ExprS> {
-        DoubleString(s) => {
-            let v = process_xstring(s.clone(), span!());
+        DoubleString(s, esc) => {
+            let v = process_xstring(s.clone(), esc, span!());
             if v.len() == 1 {
                 Ok(v.into_iter().nth(0).unwrap())
             } else {
@@ -238,23 +236,55 @@ parser! {
 
     range: Res<ExprS> {
         #[no_reduce(Range)]
-        atom[a] ws => a,
+        atom_val[a] ws => a,
 
-        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LBracePipe, LambdaOpen)]
+        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
         Range ws => Ok(ExprS(Expr::Range(ASTRange::All), span!())),
 
-        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LBracePipe, LambdaOpen)]
-        atom[a] ws Range ws => Ok(ExprS(Expr::Range(ASTRange::From(Box::new(a?))), span!())),
+        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
+        atom_val[a] ws Range ws => Ok(ExprS(Expr::Range(ASTRange::From(Box::new(a?))), span!())),
 
-        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LBracePipe, LambdaOpen)]
+        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
         val[a] ws Range ws => Ok(ExprS(Expr::Range(ASTRange::From(Box::new(a?))), span!())),
 
-        Range ws atom[a] ws => Ok(ExprS(Expr::Range(ASTRange::Till(Box::new(a?))), span!())),
+        Range ws atom_val[a] ws => Ok(ExprS(Expr::Range(ASTRange::Till(Box::new(a?))), span!())),
         Range ws val[a] ws => Ok(ExprS(Expr::Range(ASTRange::Till(Box::new(a?))), span!())),
-        atom[a] ws Range ws atom[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
+        atom_val[a] ws Range ws atom_val[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
         val[a] ws Range ws val[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
-        atom[a] ws Range ws val[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
-        val[a] ws Range ws atom[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
+        atom_val[a] ws Range ws val[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
+        val[a] ws Range ws atom_val[b] ws => Ok(ExprS(Expr::Range(ASTRange::Within(Box::new(a?), Box::new(b?))), span!())),
+    }
+
+    atom_val: Res<ExprS> {
+        #[no_reduce(Ident, Rex, NakedString, SingleString, DoubleString, Var, VarLBrace, Exec, ExecLParen, ExecLSquare)]
+        atom_seq[a] => {
+            let a = a?;
+            if let ExprS(Expr::XString(v), _) = a {
+                if v.len() == 1 {
+                    Ok(v.into_iter().next().unwrap())
+                } else {
+                    Ok(ExprS(Expr::XString(v), span!()))
+                }
+            } else {
+                unreachable!();
+            }
+        },
+    }
+
+    atom_seq: Res<ExprS> {
+        atom[a] => {
+            let a = a?;
+            Ok(ExprS(Expr::XString(vec![a]), span!()))
+        },
+        atom_seq[s] atom[a] => {
+            let a = a?;
+            if let ExprS(Expr::XString(mut v), _) = s? {
+                v.push(a);
+                Ok(ExprS(Expr::XString(v), span!()))
+            } else {
+                unreachable!();
+            }
+        }
     }
 
     atom: Res<ExprS> {
@@ -264,6 +294,8 @@ parser! {
         single_string[s] => s,
         double_string[s] => s,
         regex[r] => r,
+        var_ref[vr] => vr,
+        exec[ex] => ex,
     }
 
     ws_tuple: Res<Vec<ExprS>> {
@@ -278,7 +310,7 @@ parser! {
 
     comma_tuple: Res<Vec<ExprS>> {
         #[no_reduce(Range, Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen,
-                    ExecLSquare, Read, Recv, If, While, For, Match, MatchAll, LBracePipe, LambdaOpen)]
+                    ExecLSquare, Read, Recv, If, While, For, Match, MatchAll, LambdaOpen)]
         member[a] ws Comma ws => Ok(vec![a?]),
 
         #[no_reduce(Comma, LSquare, Member)]
@@ -566,21 +598,39 @@ parser! {
         Prefix => SetOp::Prefix,
     }
 
+    options: Res<ExprS> {
+        LSquare nl RSquare ws => Ok(ExprS(Expr::String(" ".into()), span!())),
+        LSquare nl subexpr[e] nl RSquare ws => e,
+        LSquare nl Colon nl RSquare ws => Ok(ExprS(Expr::String(":".into()), span!())),
+    }
+
     set_rule: Res<ExprS> {
         set_lhs[i] set_op[o] nl expr[e] ws =>
             Ok(ExprS(Expr::Set(o, Box::new(i?), Box::new(e?)), span!())),
 
         scope[s] nl ident[i] ws =>
-            Ok(ExprS::import(s, i?, span!())),
+            Ok(ExprS::import(s, i?, None, span!())),
 
-        scope[s] nl ident[i] ws set_op[o] nl expr[e] ws =>
-            Ok(ExprS::import_set(s, i?, o, e?, span!())),
+        scope[s] nl options[o] nl ident[i] ws =>
+            Ok(ExprS::import(s, i?, Some(o?), span!())),
 
-        scope[s] nl ident[i] ws Colon nl ident[a] ws =>
-            Ok(ExprS::import_as(s, i?, a?, span!())),
+        scope[s] nl ident[i] ws set_op[op] nl expr[e] ws =>
+            Ok(ExprS::import_set(s, i?, None, op, e?, span!())),
 
-        scope[s] nl ident[i] ws Colon nl ident[a] ws set_op[o] nl expr[e] ws=>
-            Ok(ExprS::import_as_and_set(s, i?, a?, o, e?, span!())),
+        scope[s] nl options[o] nl ident[i] ws set_op[op] nl expr[e] ws =>
+            Ok(ExprS::import_set(s, i?, Some(o?), op, e?, span!())),
+
+        scope[s] nl ident[a] ws Colon nl ident[i] ws =>
+            Ok(ExprS::import_as(s, i?, None, a?, span!())),
+
+        scope[s] nl options[o] nl ident[a] ws Colon nl ident[i] ws =>
+            Ok(ExprS::import_as(s, i?, Some(o?), a?, span!())),
+
+        scope[s] nl ident[a] ws Colon nl ident[i] ws set_op[op] nl expr[e] ws=>
+            Ok(ExprS::import_as_and_set(s, i?, None, a?, op, e?, span!())),
+
+        scope[s] nl options[o] nl ident[a] ws Colon nl ident[i] ws set_op[op] nl expr[e] ws=>
+            Ok(ExprS::import_as_and_set(s, i?, Some(o?), a?, op, e?, span!())),
     }
 
     let_expr: Res<ExprS> {
@@ -749,11 +799,11 @@ fn xstring_ensure_last_is_str(v: &mut Vec<ExprS>) {
 fn xstring_add_char(v: &mut Vec<ExprS>, c: char, width: usize) {
     xstring_ensure_last_is_str(v);
     {
-        let mut cur_str = v.last_mut().unwrap().0.get_str_mut().unwrap();
+        let cur_str = v.last_mut().unwrap().0.get_str_mut().unwrap();
         cur_str.push(c);
     }
     {
-        let mut cur_span = &mut v.last_mut().unwrap().1;
+        let cur_span = &mut v.last_mut().unwrap().1;
         *cur_span += width;
     }
 }
@@ -845,13 +895,13 @@ r##"^[_a-zA-Z][_a-zA-Z0-9]*(::[_a-zA-Z][_a-zA-Z0-9]*)*"##).unwrap();
     }
 }
 
-fn process_xstring(s: String, span: Span) -> Vec<ExprS> {
+fn process_xstring(s: String, esc: bool, span: Span) -> Vec<ExprS> {
     let mut ret = vec![ExprS(Expr::LString("".into()), Span::new(span.l, span.l))];
     let mut iter = s.chars();
     loop {
         let c = { if let Some(c) = iter.clone().nth(0) { c } else { break }};
         match c {
-            '\\' => {
+            '\\' if esc => {
                 let c = { if let Some(c) = iter.clone().nth(1) { c } else { break }};
                 match c {
                     'n' => xstring_add_char(&mut ret, '\n', 2),

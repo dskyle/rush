@@ -6,7 +6,7 @@ extern crate hostname;
 extern crate users;
 extern crate ansi_term;
 
-use rush::{util, Val, Processor};
+use rush::{util, Val, Processor, PartialLex, Tok, Span};
 
 fn make_prompt(color: bool, esc: bool) -> String {
     use users::{get_user_by_uid, get_current_uid};
@@ -46,10 +46,25 @@ fn make_prompt(color: bool, esc: bool) -> String {
     }
 }
 
-fn do_interactive_command(processor: &mut Processor, line: &str) -> bool {
+fn do_interactive_command(processor: &mut Processor, line: &str, partial: Option<&mut Option<PartialLex>>) -> bool {
     use std::panic::{self, AssertUnwindSafe};
 
-    let ret = panic::catch_unwind(AssertUnwindSafe(|| { processor.exec(&line) }));
+    let ret = match partial {
+        Some(partial) => {
+            let mut tmp = None;
+            ::std::mem::swap(&mut tmp, partial);
+            let ret = panic::catch_unwind(AssertUnwindSafe(|| { processor.exec_partial(&line, tmp) }));
+            match ret {
+                Ok(Ok(x)) => { *partial = None; Ok(x)},
+                Ok(Err(mut p)) => {
+                    *partial = Some(p);
+                    return true
+                },
+                Err(e) => Err(e),
+            }
+        },
+        None => panic::catch_unwind(AssertUnwindSafe(|| { processor.exec(&line) })),
+    };
     match ret {
         Ok((ret, con)) => {
             match ret {
@@ -76,6 +91,8 @@ fn do_interactive_lf() {
     use linefeed::terminal::Signal;
     use std::rc::Rc;
 
+    let mut processor = Processor::new();
+
     let mut reader = Reader::new(make_prompt(false, true)).unwrap();
 
     reader.set_completer(Rc::new(linefeed::complete::PathCompleter{}));
@@ -87,7 +104,6 @@ fn do_interactive_lf() {
 
     let mut history_path = ::std::path::PathBuf::from(util::get_home());
     history_path.push(".rush_history");
-    //let history_path = "/home/dskyle/.rush_history";
 
     {
         if let Ok(hist) = File::open(history_path.clone()) {
@@ -100,12 +116,25 @@ fn do_interactive_lf() {
         }
     }
 
-    let mut processor = Processor::new();
+    let mut partial = None;
+
     loop {
-        reader.set_prompt(&make_prompt(true, true));
+        {
+            processor.interp.jobs.poll();
+            let finished = processor.interp.jobs.check();
+            if finished.len() > 0 {
+                eprintln!("Finished: {:?}", finished);
+            }
+        }
+
+        if partial == None {
+            reader.set_prompt(&make_prompt(true, true));
+        } else {
+            reader.set_prompt("  > ");
+        }
 
         match reader.read_line() {
-            Ok(ReadResult::Input(input)) => {
+            Ok(ReadResult::Input(mut input)) => {
                 if input.len() == 0 { continue }
 
                 let diff = {
@@ -114,7 +143,8 @@ fn do_interactive_lf() {
                 };
                 if diff { reader.add_history(input.clone()) }
 
-                if !do_interactive_command(&mut processor, &input) { break }
+                input.push('\n');
+                if !do_interactive_command(&mut processor, &input, Some(&mut partial)) { break }
             },
             Ok(ReadResult::Signal(signal)) => {
                 match signal {
@@ -155,7 +185,7 @@ fn do_interactive() {
 
                 rl.add_history_entry(&line);
 
-                if !do_interactive_command(&mut processor, &line) { break }
+                if !do_interactive_command(&mut processor, &line, None) { break }
             },
             Err(ReadlineError::Interrupted) => {
                 continue

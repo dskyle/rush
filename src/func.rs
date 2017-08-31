@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::borrow::Cow;
 use std::fmt;
 
-type BuiltinFn = fn(&Interp, &mut LocalVars) -> Val;
-type MacroFn = fn(&Interp, &mut LocalVars, Val) -> Val;
+type BuiltinFn = fn(&mut Interp, &mut LocalVars) -> Val;
+type MacroFn = fn(&mut Interp, &mut LocalVars, Val) -> Val;
 
 pub enum FuncBody {
     BuiltIn(BuiltinFn),
@@ -205,7 +205,7 @@ impl ArgSig {
                     cur = &*e;
                 },
                 &Ref(ref s) => {
-                    return Self::from_val(&*s.get_ref(), embed, depth);
+                    return s.with_ref(|x| Self::from_val(x, embed, depth));
                 },
                 &Tup(ref v) => {
                     if v.len() == 0 { return None }
@@ -249,7 +249,7 @@ impl FuncKey {
                 }
             },
             &Str(ref s) => return FuncKey{ arg0: ArgSig{depth: 0, name: s.to_string()}, arg1: None },
-            &Ref(ref r) => Self::from_val(&*r.get_ref()),
+            &Ref(ref r) => r.with_ref(|x| Self::from_val(x)),
             &Embed(ref e) => Self::from_val(&*e),
             _ => panic!("Function call value must be scalar string or tuple"),
         }

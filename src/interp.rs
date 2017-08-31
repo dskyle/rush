@@ -6,96 +6,63 @@ use rush_rt::error::{RuntimeError};
 use rush_rt::pat::{ValMatcher};
 use rush_rt::range::{RangeExt};
 use rush_pat::subsume::{Subsumes, Subsumption};
-use std::collections::{HashMap, BTreeMap};
-use std::borrow::Cow;
+use std::collections::{HashMap};
+use std::borrow::{Cow, Borrow, BorrowMut};
 use func::{Control, Func, FuncBody, FuncMap};
 use std::cell::RefCell;
 use std::rc::Rc;
+use nix::unistd::{dup, dup2, close, Pid};
+use nix::sys::signal::{sigaction, SigAction, SigHandler, SaFlags, SigSet, Signal};
+use jobs::Jobs;
+use pipeline::Pipeline;
+use std::sync::atomic::Ordering;
 
 type VarMap = HashMap<String, VarRef>;
 
-type JobMap = BTreeMap<usize, i32>;
-
-#[derive(Debug)]
-pub struct Jobs {
-    jobs: JobMap,
-    cur_id: usize,
-}
-
-impl Jobs {
-    pub fn new() -> Jobs {
-        Jobs { jobs: JobMap::new(), cur_id: 0 }
-    }
-
-    fn make_id(&mut self) -> usize {
-        let ret = self.cur_id;
-        self.cur_id += 1;
-        ret
-    }
-
-    pub fn add(&mut self, pid: i32) -> usize {
-        let id = self.make_id();
-        self.jobs.insert(id, pid);
-        id
-    }
-
-    pub fn iter(&self) -> ::std::collections::btree_map::Iter<usize, i32> {
-        self.jobs.iter()
-    }
-}
-
 pub struct Interp {
-    sys_vars: RefCell<VarMap>,
-    global_vars: RefCell<VarMap>,
+    global_vars: VarMap,
 
-    pub funcs: RefCell<FuncMap>,
-    pub jobs: RefCell<Jobs>,
+    pub funcs: FuncMap,
+    pub jobs: Jobs,
 }
 
 impl Interp {
     pub fn new() -> Interp {
         Interp {
-            sys_vars: HashMap::new().into(),
+            //sys_vars: HashMap::new().into(),
             global_vars: HashMap::new().into(),
             funcs: FuncMap::new().into(),
-            jobs: Jobs::new().into()
+            jobs: Jobs::new().into(),
         }
     }
 
+    /*
     fn get_varmap(&self, scope: ImportScope) -> &RefCell< VarMap> {
         match scope {
             ImportScope::Sys => &self.sys_vars,
             ImportScope::Global => &self.global_vars,
         }
-    }
+    }*/
 
-    fn lookup_import(&self, scope: ImportScope, name: &str, assign: Option<(SetOp, Val)>) -> VarRef {
-        let mut vars = self.get_varmap(scope).borrow_mut();
-        if let Some(r) = vars.get(name) {
-            if let Some((s, v)) = assign {
-                if let Some(v) = v.get_str() {
-                    match s {
-                        SetOp::Assign => r.set(Val::str(v)),
-                        SetOp::Prefix => r.set(Val::Str(v.to_string() + r.get().get_str().unwrap())),
-                        SetOp::Suffix => r.set(Val::Str(r.get().get_str().unwrap().to_string() + v)),
-                        _ => {},
-                    }
-                } else {
-                    panic!("sys and global vars must be scalar string");
+    fn lookup_import(&mut self, scope: ImportScope, name: &str, options: Option<Val>) -> VarRef {
+        match scope {
+            ImportScope::Sys => {
+                let delim = options.and_then(|x| x.get_1char());
+                return VarRef::using(::rush_rt::vars::EnvOps::new(name, delim));
+            },
+            ImportScope::Global => {
+                if options.is_some() {
+                    panic!("global variables do not support delimiter options");
                 }
-            }
-            return r.clone()
+                if let Some(r) = self.global_vars.get(name) {
+                    return r.clone()
+                }
+                return self.global_vars.entry(name.to_string()).or_insert(VarRef::new(Val::void())).clone();
+            },
         }
-        if let Some((_, v)) = assign {
-            if let Some(v) = v.get_str() {
-                return vars.entry(name.to_string()).or_insert(VarRef::new(Val::str(v))).clone();
-            }
-            panic!("sys and global vars must be scalar string");
-        }
-        panic!("Unknown sys or global var must be initialized");
     }
 
-    fn call_op_bool(&self, val: Val, span: Span, l: &mut LocalVars) -> Val {
+    fn call_op_bool(&mut self, val: Val, span: Span, l: &mut LocalVars) -> Val {
         let mut v = Vec::with_capacity(2);
         v.push(Val::Str("op::bool".to_string()));
         v.push(val);
@@ -108,7 +75,7 @@ impl Interp {
         };
     }
 
-    fn if_cond(&self, r: &mut LocalVars, cond: &ExprS, has_else: bool) -> Result<bool, (Val, Control)> {
+    fn if_cond(&mut self, r: &mut LocalVars, cond: &ExprS, has_else: bool) -> Result<bool, (Val, Control)> {
         match *cond {
             ExprS(Expr::Let(ref b, ref e), _span) => {
                 let mut val = self.from_expr(&*e, r);
@@ -161,7 +128,7 @@ impl Interp {
         };
     }
 
-    fn do_if(&self, r: &mut LocalVars, cond: &ExprS, then: &Vec<ExprS>, el: &Option<Vec<ExprS>>) -> (Val, Control) {
+    fn do_if(&mut self, r: &mut LocalVars, cond: &ExprS, then: &Vec<ExprS>, el: &Option<Vec<ExprS>>) -> (Val, Control) {
         //println!("{:?}", e);
         let mut res = (Val::void(), Control::Done);
         let has_else = el.is_some() && el.as_ref().unwrap().len() > 0;
@@ -182,7 +149,7 @@ impl Interp {
         res
     }
 
-    fn do_while(&self, r: &mut LocalVars, cond: &ExprS, lo: &Vec<ExprS>) -> (Val, Control) {
+    fn do_while(&mut self, r: &mut LocalVars, cond: &ExprS, lo: &Vec<ExprS>) -> (Val, Control) {
         //println!("{:?}", e);
         let mut res = (Val::void(), Control::Done);
         loop {
@@ -203,7 +170,7 @@ impl Interp {
         res
     }
 
-    fn do_lambda(&self, r: &mut LocalVars,
+    fn do_lambda(&mut self, r: &mut LocalVars,
                  c: &Vec<(String, Option<ExprS>)>,
                  p: &Pat, b: &RefCell<Option<Vec<ExprS>>>) -> (Val, Control) {
         use self::Val::*;
@@ -243,7 +210,7 @@ impl Interp {
         }
     }
 
-    fn do_match(&self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
+    fn do_match(&mut self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
         let (val, con) = self.from_expr(e, r);
         if con.stops_exec() {
             return (val, con)
@@ -260,7 +227,7 @@ impl Interp {
         (val, con)
     }
 
-    fn do_match_all(&self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
+    fn do_match_all(&mut self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
         let (val, con) = self.from_expr(e, r);
         if con.stops_exec() {
             return (val, con)
@@ -281,7 +248,7 @@ impl Interp {
         (Val::Tup(ret), con)
     }
 
-    fn do_for(&self, r: &mut LocalVars, pat: &Pat, val: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
+    fn do_for(&mut self, r: &mut LocalVars, pat: &Pat, val: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
         let mut res = (Val::void(), Control::Done);
         let val = self.from_expr(val, r);
         if val.1.stops_exec() {
@@ -305,19 +272,19 @@ impl Interp {
         res
     }
 
-    pub fn call_iter(&self, r: &mut LocalVars, val: Val, ispan: Span) -> Val {
+    pub fn call_iter(&mut self, r: &mut LocalVars, val: Val, ispan: Span) -> Val {
         let call_iterate = Val::Tup(vec![Val::str("iter"), val]);
         self.try_call(call_iterate, ispan, r)
             .unwrap_or_else(|v| Val::err(RuntimeError::InvalidIter(Box::new(v)), Some(ispan)))
     }
 
-    pub fn call_next(&self, r: &mut LocalVars, val: Val, ispan: Span) -> Val {
+    pub fn call_next(&mut self, r: &mut LocalVars, val: Val, ispan: Span) -> Val {
         let call_iterate = Val::Tup(vec![Val::str("next"), val]);
         self.try_call(call_iterate, ispan, r)
             .unwrap_or_else(|v| Val::err(RuntimeError::InvalidNext(Box::new(v)), Some(ispan)))
     }
 
-    fn do_for_iter(&self, r: &mut LocalVars, pat: &Pat, iter: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
+    fn do_for_iter(&mut self, r: &mut LocalVars, pat: &Pat, iter: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
         let mut res = (Val::void(), Control::Done);
         let ispan = iter.1;
         let (mut cur, con) = self.from_expr(iter, r);
@@ -347,7 +314,7 @@ impl Interp {
         res
     }
 
-    fn do_string(&self, s: &str, _: &mut LocalVars) -> (Val, Control) {
+    fn do_string(&mut self, s: &str, _: &mut LocalVars) -> (Val, Control) {
         use glob::{glob_with, MatchOptions};
         let options = MatchOptions {
             case_sensitive: true,
@@ -370,7 +337,7 @@ impl Interp {
 
     }
 
-    fn do_xstring(&self, v: &Vec<ExprS>, r: &mut LocalVars) -> (Val, Control) {
+    fn do_xstring(&mut self, v: &Vec<ExprS>, r: &mut LocalVars) -> (Val, Control) {
         let mut ret = "".to_string();
         for e in v {
             let (mut val, c) = self.from_expr(e, r);
@@ -398,25 +365,25 @@ impl Interp {
         (Val::Str(ret), Control::Done)
     }
 
-    fn do_background(&self, e: &ExprS, r: &mut LocalVars) -> (Val, Control) {
-        use nix::unistd::{fork, ForkResult};
+    fn do_background(&mut self, e: &ExprS, r: &mut LocalVars) -> (Val, Control) {
+        use jobs::SpawnResult::*;
 
-        match fork() {
-            Ok(ForkResult::Parent { child, .. }) => {
-                let job_id = self.jobs.borrow_mut().add(child);
-                (Val::Tup(vec![Val::str("Job"), Val::Str(job_id.to_string()),
-                                                Val::Str(child.to_string())]),
+        match self.jobs.spawn_bg() {
+            Ok(Original(job)) => {
+                (Val::Tup(vec![Val::str("Job"), Val::Str(job.jid().unwrap().to_string()),
+                                                Val::Str(job.pid().unwrap().to_string())]),
                      Control::Done)
-            },
-            Ok(ForkResult::Child) => {
+            }
+            Ok(Child) => {
                 let ret = self.exec_stmt(e, r);
-                (ret.0, Control::Exit)
+                let code = ret.0.get_int().unwrap_or(0) as i32;
+                ::std::process::exit(code)
             },
             Err(e) => (Val::err_string(format!("{}", e)), Control::Done),
         }
     }
 
-    pub fn from_expr(&self, e: &ExprS, r: &mut LocalVars) -> (Val, Control) {
+    pub fn from_expr(&mut self, e: &ExprS, r: &mut LocalVars) -> (Val, Control) {
         use self::Expr::*;
         use self::Val::*;
 
@@ -462,7 +429,7 @@ impl Interp {
             Expr::Range(ref rng) => {
                 use rush_parser::ast::ASTRange;
                 use rush_parser::ast::ASTRange::*;
-                fn eval_expr(i: &Interp, e: &ExprS, l: &mut LocalVars) -> Result<ExprS, (Val, Control)> {
+                fn eval_expr(i: &mut Interp, e: &ExprS, l: &mut LocalVars) -> Result<ExprS, (Val, Control)> {
                     if let Some(_) = e.0.get_atom() {
                         return Ok(e.clone());
                     }
@@ -549,7 +516,7 @@ impl Interp {
         }
     }
 
-    fn do_call(&self, m: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
+    fn do_call(&mut self, m: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
         let (val, con) = self.exec_stmt(n, l);
         if con.stops_exec() {
             return (val, con)
@@ -565,7 +532,7 @@ impl Interp {
         (val.subst(m), con)
     }
 
-    fn get_exec(&self, _: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
+    fn get_exec(&mut self, _: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
         use std::io::{Read, Seek, SeekFrom};
         use std::os::unix::io::AsRawFd;
 
@@ -592,7 +559,7 @@ impl Interp {
         (Val::str(buf), Control::Done)
     }
 
-    fn get_exec_list(&self, m: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
+    fn get_exec_list(&mut self, m: SubsMode, n: &ExprS, l: &mut LocalVars) -> (Val, Control) {
         let (val, con) = self.get_exec(m, n, l);
         if con.stops_exec() {
             return (val, con);
@@ -608,7 +575,7 @@ impl Interp {
         }
     }
 
-    fn get_var_ref(&self, m: SubsMode, n: &ExprS, r: &mut LocalVars) -> Val {
+    fn get_var_ref(&mut self, m: SubsMode, n: &ExprS, r: &mut LocalVars) -> Val {
         use self::Expr::*;
         match n.0 {
             Ident(ref id) => self.get_var_ref_id(m, id, n.1, r),
@@ -625,7 +592,7 @@ impl Interp {
         }
     }
 
-    fn get_var_ref_id(&self, m: SubsMode, id: &str, span: Span, r: &mut LocalVars) -> Val {
+    fn get_var_ref_id(&mut self, m: SubsMode, id: &str, span: Span, r: &mut LocalVars) -> Val {
         let v = r.get(id);
         let r = match v {
             Some(r) => Val::Ref(r.clone()),
@@ -635,7 +602,7 @@ impl Interp {
         r.subst(m)
     }
 
-    pub fn try_call(&self, val: Val, span: Span, l: &mut LocalVars) -> Result<Val, Val> {
+    pub fn try_call(&mut self, val: Val, span: Span, l: &mut LocalVars) -> Result<Val, Val> {
         let val = match val {
             Val::Tup(_) => val,
             Val::Error(..) => return Ok(val),
@@ -671,7 +638,7 @@ impl Interp {
         }
     }
 
-    pub fn call(&self, val: Val, span: Span, l: &mut LocalVars) -> Val {
+    pub fn call(&mut self, val: Val, span: Span, l: &mut LocalVars) -> Val {
         let mut ret = match self.try_call(val, span, l) {
             Ok(val) => val,
             Err(val) => {
@@ -691,21 +658,21 @@ impl Interp {
         }
     }
 
-    pub fn do_set(&self, op: SetOp, n: &ExprS, mut val: Val, local_vars: &mut LocalVars) -> Val {
-        fn imp(this: &Interp, n: &ExprS, l: &mut LocalVars, f: &mut FnMut(&mut Val)) -> Result<(), Val> {
-            fn do_id(id: &str, l: &mut LocalVars, f: &mut FnMut(&mut Val)) -> Result<(), Val> {
+    pub fn do_set(&mut self, op: SetOp, n: &ExprS, mut val: Val, local_vars: &mut LocalVars) -> Val {
+        fn imp(this: &mut Interp, n: &ExprS, l: &mut LocalVars, f: &mut FnMut(&mut Interp, &mut Val)) -> Result<(), Val> {
+            fn do_id(this: &mut Interp, id: &str, l: &mut LocalVars, f: &mut FnMut(&mut Interp, &mut Val)) -> Result<(), Val> {
                 if let Some(var) = l.get(id) {
-                    f(&mut *var.get_mut());
+                    var.with_mut(|x| f(this, x));
                     return Ok(());
                 }
                 let var = l.bind(id.clone(), Val::void());
-                f(&mut *var.get_mut());
+                var.with_mut(|x| f(this, x));
                 Ok(())
             }
 
             match n.0 {
                 Expr::Ident(ref id) => {
-                    do_id(id, l, f)
+                    do_id(this, id, l, f)
                 },
                 Expr::Index(_, ref lhs, ref index) => {
                     use rush_rt::val::Indexing;
@@ -716,9 +683,10 @@ impl Interp {
                         }
                         match Indexing::from_val(&index) {
                             Ok(index) => {
-                                imp(this, lhs, l, &mut |v: &mut Val| {
+                                imp(this, lhs, l, &mut |this: &mut Interp, v: &mut Val| {
                                     v.with_index_mut(&index, &mut |v: &mut Val| {
-                                        f(v);
+                                        v.simplify_shallow();
+                                        f(this, v);
                                     }).unwrap();
                                 })
                             },
@@ -727,7 +695,7 @@ impl Interp {
                     })
                 },
                 Expr::Member(..) => {
-                    Err(Val::err_str("Setting to members not suppported"))
+                    Err(Val::err_str("Indexed setting to properties not suppported"))
                 },
                 Expr::Tuple(..) => {
                     Err(Val::err_str("Setting to tuples not suppported"))
@@ -739,7 +707,7 @@ impl Interp {
                     }
                     match val.take_str() {
                         Ok(ref id) if ::rush_parser::lex::is_identifier(id) => {
-                            do_id(id, l, f)
+                            do_id(this, id, l, f)
                         },
                         Ok(id) => {
                             Err(Val::err_string(format!("Invalid identifier: {:?}", id)))
@@ -752,51 +720,110 @@ impl Interp {
             }
         }
 
-        match imp(self, n, local_vars, &mut |old_val: &mut Val| {
-            use self::SetOp::*;
-            match op {
-                Assign => {
-                    ::std::mem::swap(old_val, &mut val);
-                },
-                AssignIfNull => if old_val.is_void() {
-                    ::std::mem::swap(old_val, &mut val);
-                },
-                Suffix => match old_val {
-                    &mut Val::Tup(ref mut v) => {
-                        let mut tmp = Val::void();
-                        ::std::mem::swap(&mut tmp, &mut val);
-                        v.push(tmp);
-                    },
-                    _ => {
-                        let mut tmp = Val::void();
-                        ::std::mem::swap(&mut tmp, old_val);
-                        let mut new = Val::void();
-                        ::std::mem::swap(&mut new, &mut val);
-                        *old_val = Val::Tup(vec![tmp, new]);
-                    },
-                },
-                Prefix => match old_val {
-                    &mut Val::Tup(ref mut v) => {
-                        let mut tmp = Val::void();
-                        ::std::mem::swap(&mut tmp, &mut val);
-                        v.insert(0, tmp);
-                    },
-                    _ => {
-                        let mut tmp = Val::void();
-                        ::std::mem::swap(&mut tmp, old_val);
-                        let mut new = Val::void();
-                        ::std::mem::swap(&mut new, &mut val);
-                        *old_val = Val::Tup(vec![new, tmp]);
-                    },
-                },
-            }
-        }) {
-            Ok(..) => Val::void(),
-            Err(e) => e,
+        match n.0 {
+            Expr::Member(_, ref lhs, ref rhs) => {
+                if op != SetOp::Assign {
+                    return Val::err_str("Must use ordinary assignment when setting properties")
+                }
+                let (mut rval, con) = self.from_expr(&**rhs, local_vars);
+                if con.stops_exec() {
+                    return rval;
+                }
+                rval.eval();
+                let mut to_call = match rval {
+                    e @ Val::Error(..) => return e,
+                    Val::Str(_) => rval,
+                    Val::Tup(_) => return Val::err_str("Cannot set into method calls, only properties"),
+                    _ => unreachable!(),
+                };
+                let lspan = lhs.1;
+                match imp(self, lhs, local_vars, &mut |this: &mut Interp, old_val: &mut Val| {
+                    let mut tmp = Val::void();
+                    ::std::mem::swap(&mut tmp, old_val);
+                    let mut input = Val::void();
+                    ::std::mem::swap(&mut val, &mut input);
+                    let mut prop_name = Val::void();
+                    ::std::mem::swap(&mut to_call, &mut prop_name);
+                    let call = vec!["op::set_prop".into(), tmp, prop_name, input];
+                    match this.try_call(Val::Tup(call), lspan, &mut LocalVars::new()) {
+                        Ok(mut val) => {
+                            ::std::mem::swap(old_val, &mut val);
+                        },
+                        Err(val) => {
+                            //eprintln!("val: {:?}", val);
+                            let mut iter = val.take_tup().unwrap().into_iter();
+                            iter.next().unwrap(); // Discard fn name
+                            let mut val = iter.next().unwrap();
+                            let prop = iter.next().unwrap();
+                            let mut input = iter.next().unwrap();
+
+                            use ::rush_rt::val::Indexing;
+                            let index = Indexing::from_val(&prop);
+                            if let Ok(index) = index {
+                                match val.with_index_mut(&index, &mut |old_val: &mut Val| {
+                                    ::std::mem::swap(old_val, &mut input);
+                                }) {
+                                    Ok(..) => ::std::mem::swap(old_val, &mut val),
+                                    Err(..) => {},
+                                }
+                            }
+                        },
+                    }
+                }) {
+                    Ok(..) => Val::void(),
+                    Err(e) => e,
+                }
+            },
+            _ => {
+                match imp(self, n, local_vars, &mut |_this: &mut Interp, old_val: &mut Val| {
+                    use self::SetOp::*;
+                    match op {
+                        Assign => {
+                            ::std::mem::swap(old_val, &mut val);
+                        },
+                        AssignIfNull => if old_val.is_void() {
+                            ::std::mem::swap(old_val, &mut val);
+                        },
+                        Suffix => match old_val {
+                            &mut Val::Tup(ref mut v) => {
+                                let mut tmp = Val::void();
+                                ::std::mem::swap(&mut tmp, &mut val);
+                                v.push(tmp);
+                            },
+                            _ => {
+                                let mut tmp = Val::void();
+                                ::std::mem::swap(&mut tmp, old_val);
+                                let mut new = Val::void();
+                                ::std::mem::swap(&mut new, &mut val);
+                                *old_val = Val::Tup(vec![tmp, new]);
+                            },
+                        },
+                        Prefix => match old_val {
+                            &mut Val::Tup(ref mut v) => {
+                                let mut tmp = Val::void();
+                                ::std::mem::swap(&mut tmp, &mut val);
+                                v.insert(0, tmp);
+                            },
+                            _ => {
+                                let mut tmp = Val::void();
+                                ::std::mem::swap(&mut tmp, old_val);
+                                let mut new = Val::void();
+                                ::std::mem::swap(&mut new, &mut val);
+                                *old_val = Val::Tup(vec![new, tmp]);
+                            },
+                        },
+                    }
+                }) {
+                    Ok(..) => Val::void(),
+                    Err(e) => e,
+                }
+            },
         }
     }
 
-    pub fn exec_stmt(&self, stmt_s: &ExprS, local_vars: &mut LocalVars) -> (Val, Control) {
+    pub fn exec_stmt(&mut self, stmt_s: &ExprS, local_vars: &mut LocalVars) -> (Val, Control) {
+        self.jobs.poll();
+
         let &ExprS(ref stmt, span) = stmt_s;
         match *stmt {
             Expr::Let(ref bind, ref v) => {
@@ -818,7 +845,7 @@ impl Interp {
                 //println!("Bind {:?} to {:?}", n, val);
                 (self.do_set(op, &**n, val.0, local_vars), Control::Done)
             },
-            Expr::Import(scope, ref name, ref rename, ref assign) => {
+            Expr::Import(scope, ref name, ref options, ref rename, ref assign) => {
                 if let Some(name) = name.get_ident() {
                     let assign = match assign {
                         &Some((op, ref e)) => {
@@ -831,7 +858,19 @@ impl Interp {
                         },
                         &None => None,
                     };
-                    let var = self.lookup_import(scope, name, assign);
+                    let options = options.clone().map(|x| self.from_expr(&*x, local_vars).0 );
+                    let var = self.lookup_import(scope, name, options);
+                    if let Some((op, val)) = assign {
+                        match op {
+                            SetOp::Assign => var.set(val),
+                            SetOp::AssignIfNull => {
+                                if var.get().is_void() {
+                                    var.set(val)
+                                }
+                            },
+                            _ => unimplemented!(),
+                        }
+                    }
                     if let &Some(ref rename) = rename {
                         if let Some(rename) = rename.get_ident() {
                             local_vars.import(rename, var);
@@ -910,7 +949,7 @@ impl Interp {
         }
     }
 
-    fn do_and_or(&self, lhs: &ExprS, rhs: &ExprS, is_or: bool, local_vars: &mut LocalVars) -> (Val, Control) {
+    fn do_and_or(&mut self, lhs: &ExprS, rhs: &ExprS, is_or: bool, local_vars: &mut LocalVars) -> (Val, Control) {
         let (val, con) = self.exec_stmt(lhs, local_vars);
         if con.stops_exec() {
             return (val, con)
@@ -930,7 +969,7 @@ impl Interp {
         }
     }
 
-    fn do_pipe(&self, stages: &Vec<ExprS>, outfile: &Option<Box<ExprS>>, local_vars: &mut LocalVars) -> (Val, Control) {
+    fn do_pipe(&mut self, stages: &Vec<ExprS>, outfile: &Option<Box<ExprS>>, local_vars: &mut LocalVars) -> (Val, Control) {
         let mut pipeline = Pipeline::create(stages);
         let ret = outfile.as_ref().map(|outfile| {
             self.from_expr(&**outfile, local_vars)
@@ -940,11 +979,11 @@ impl Interp {
                 return (val.clone(), *con)
             }
         }
-        let (val, con) = pipeline.exec(&self, ret.and_then(|x| x.0.get_string()), local_vars);
+        let (val, con) = pipeline.exec(self, ret.and_then(|x| x.0.get_string()), local_vars);
         (val, con)
     }
 
-    fn do_read(&self, ids: &Vec<ExprS>, local_vars: &mut LocalVars) -> (Val, Control) {
+    fn do_read(&mut self, ids: &Vec<ExprS>, local_vars: &mut LocalVars) -> (Val, Control) {
 
         if ids.len() == 0 {
             return (Val::false_(), Control::Done);
@@ -981,7 +1020,7 @@ impl Interp {
         return ret;
     }
 
-    fn do_recv(&self, pat: &Pat, local_vars: &mut LocalVars, exact: bool) -> (Val, Control) {
+    fn do_recv(&mut self, pat: &Pat, local_vars: &mut LocalVars, exact: bool) -> (Val, Control) {
         use std::io::{self, BufRead};
 
         let stdin = io::stdin();
@@ -1011,7 +1050,7 @@ impl Interp {
         return ret;
     }
 
-    pub fn exec_stmt_list(&self, stmt_list: &Vec<ExprS>, local_vars: &mut LocalVars) -> (Val, Control) {
+    pub fn exec_stmt_list(&mut self, stmt_list: &Vec<ExprS>, local_vars: &mut LocalVars) -> (Val, Control) {
         use self::Control::*;
 
         let mut ret = Val::void();
@@ -1028,142 +1067,12 @@ impl Interp {
         return (ret, Control::Done)
     }
 
-    pub fn exec(&self, stmt_list: &Vec<ExprS>) -> (Val, Control) {
+    pub fn exec(&mut self, stmt_list: &Vec<ExprS>) -> (Val, Control) {
         let mut local_vars = LocalVars::new();
         local_vars.enter_scope();
         let ret = self.exec_stmt_list(stmt_list, &mut local_vars);
         ret.0.unhandled();
         local_vars.exit_scope();
         ret
-    }
-}
-
-use nix::unistd::{fork, ForkResult, pipe, dup, dup2, close};
-use nix::sys::wait::{waitpid, WaitStatus};
-
-#[derive(Debug)]
-enum StageStatus {
-    Initialized,
-    Background(i32),
-    Foreground,
-    Completed(WaitStatus),
-}
-
-#[derive(Debug)]
-struct Stage<'a> {
-    code: &'a ExprS,
-    status: StageStatus,
-}
-
-impl<'a> Stage<'a> {
-    fn create(code: &'a ExprS) -> Stage {
-        Stage{code, status: StageStatus::Initialized}
-    }
-}
-
-#[derive(Debug)]
-struct Pipeline<'a> {
-    stages: Vec<Stage<'a>>,
-}
-
-impl<'a> Pipeline<'a> {
-    fn create(stages: &'a Vec<ExprS>) -> Pipeline {
-        Pipeline{ stages: stages.into_iter().map(|x| Stage::create(x)).collect() }
-    }
-
-    fn exec<S: ToString>(&mut self, interp: &Interp, outfile: Option<S>, local_vars: &mut LocalVars) -> (Val, Control) {
-        let mut use_input = 0;
-        let n = self.stages.len();
-        if n == 0 {
-            return (Val::void(), Control::Done);
-        }
-        for ref mut s in self.stages.iter_mut().take(n - 1) {
-            let (pread, pwrite) = pipe().unwrap();
-            let (input, output) = (use_input, pwrite);
-            use_input = pread;
-            match fork() {
-                Ok(ForkResult::Parent { child, .. }) => {
-                    s.status = StageStatus::Background(child);
-                    if input != 0 {
-                        close(input).unwrap();
-                    }
-                    if output != 1 {
-                        close(output).unwrap();
-                    }
-                },
-                Ok(ForkResult::Child) => {
-                    if input != 0 {
-                        dup2(input, 0).unwrap();
-                        close(input).unwrap();
-                    }
-                    if output != 1 {
-                        dup2(output, 1).unwrap();
-                        close(output).unwrap();
-                    }
-                    let (val, _) = interp.exec_stmt(s.code, local_vars);
-                    if let Val::Tup(ref v) = val {
-                        if v.len() == 2 && v[0].get_str() == Some("Status") {
-                            if let Some(v) = v[1].get_str() {
-                                if let Ok(x) = str::parse::<i32>(v) {
-                                    ::std::process::exit(x);
-                                }
-                            }
-                        }
-                    }
-                    ::std::process::exit(0);
-                },
-                Err(_) => panic!("Fork failed!"),
-            }
-        }
-        let (val, con) = {
-            let last_stage = self.stages.last_mut().unwrap();
-
-            let oldin = if use_input != 0 {
-                let oldin = dup(0).unwrap();
-                dup2(use_input, 0).unwrap();
-                close(use_input).unwrap();
-                Some(oldin)
-            } else {
-                None
-            };
-
-            let oldout = if let Some(outfile) = outfile {
-                let oldout = dup(1).unwrap();
-
-                use std::fs::File;
-                use std::os::unix::io::IntoRawFd;
-
-                let fout = File::create(outfile.to_string()).unwrap();
-                let fd = fout.into_raw_fd();
-
-                dup2(fd, 1).unwrap();
-                close(fd).unwrap();
-                Some(oldout)
-            } else {
-                None
-            };
-
-            last_stage.status = StageStatus::Foreground;
-            let ret = interp.exec_stmt(last_stage.code, local_vars);
-
-            if let Some(oldin) = oldin {
-                dup2(oldin, 0).unwrap();
-                close(oldin).unwrap();
-            }
-
-            if let Some(oldout) = oldout {
-                dup2(oldout, 1).unwrap();
-                close(oldout).unwrap();
-            }
-
-            ret
-        };
-        for ref mut s in self.stages.iter_mut() {
-            if let StageStatus::Background(pid) = s.status {
-                let status = waitpid(pid, None).unwrap();
-                s.status = StageStatus::Completed(status);
-            }
-        }
-        return (val, con);
     }
 }

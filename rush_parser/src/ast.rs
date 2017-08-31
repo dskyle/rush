@@ -233,7 +233,7 @@ pub enum Expr {
     Read(Vec<ExprS>),
     Recv(Pat),
     Set(SetOp, Box<ExprS>, Box<ExprS>),
-    Import(ImportScope, Box<ExprS>, Option<Box<ExprS>>, Option<(SetOp, Box<ExprS>)>),
+    Import(ImportScope, Box<ExprS>, Option<Box<ExprS>>, Option<Box<ExprS>>, Option<(SetOp, Box<ExprS>)>),
     And(Box<ExprS>, Box<ExprS>),
     Or(Box<ExprS>, Box<ExprS>),
     FuncDec(Pat, RefCell<Option<Vec<ExprS>>>),
@@ -295,34 +295,37 @@ impl ExprS {
         ExprS(Expr::Var(m, Box::new(e)), sp)
     }
 
-    pub fn import(scope: ImportScope, name: ExprS, sp: Span) -> ExprS {
-        ExprS(Expr::Import(scope, Box::new(name), None, None), sp)
+    pub fn import(scope: ImportScope, name: ExprS, opts: Option<ExprS>, sp: Span) -> ExprS {
+        ExprS(Expr::Import(scope, Box::new(name), opts.map(|x| Box::new(x)), None, None), sp)
     }
 
     pub fn import_as(scope: ImportScope,
                      name: ExprS,
+                     opts: Option<ExprS>,
                      name_as: ExprS,
                      sp: Span) -> ExprS {
-        ExprS(Expr::Import(scope, Box::new(name),
+        ExprS(Expr::Import(scope, Box::new(name), opts.map(|x| Box::new(x)),
                            Some(Box::new(name_as)), None), sp)
     }
 
     pub fn import_set(scope: ImportScope,
                       name: ExprS,
+                      opts: Option<ExprS>,
                       op: SetOp,
                       set: ExprS,
                       sp: Span) -> ExprS {
-        ExprS(Expr::Import(scope, Box::new(name), None,
+        ExprS(Expr::Import(scope, Box::new(name), opts.map(|x| Box::new(x)), None,
                            Some((op, Box::new(set)))), sp)
     }
 
     pub fn import_as_and_set(scope: ImportScope,
                              name: ExprS,
+                             opts: Option<ExprS>,
                              name_as: ExprS,
                              op: SetOp,
                              set: ExprS,
                              sp: Span) -> ExprS {
-        ExprS(Expr::Import(scope, Box::new(name),
+        ExprS(Expr::Import(scope, Box::new(name), opts.map(|x| Box::new(x)),
                            Some(Box::new(name_as)),
                            Some((op, Box::new(set)))), sp)
     }
@@ -639,7 +642,7 @@ impl fmt::Debug for Expr {
             &Read(ref p) => write!(f, "Read({:#?})", p),
             &Recv(ref p) => write!(f, "Recv({:#?})", p),
             &Set(o, ref l, ref r) => write!(f, "{:#?}({:#?} = {:#?})", o, l, r),
-            &Import(s, ref l, ref r, ref i) => write!(f, "Import({:#?} {:#?} : {:#?} = {:#?})", s, l, r, i),
+            &Import(s, ref l, ref o, ref r, ref i) => write!(f, "Import({:#?} {:#?} : {:#?} <{:#?}> = {:#?})", s, r, l, o, i),
             &Index(_, ref n, ref i) => write!(f, "Index({:#?}[{:#?}])", n, i),
             &Member(_, ref l, ref r) => write!(f, "({:#?}$.{:#?})", l, r),
             &And(ref l, ref r) => write!(f, "({:#?} && {:#?})", l, r),
