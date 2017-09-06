@@ -59,9 +59,12 @@ pub enum SetOp {
     Prefix,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum  ManOp {
-    Merge{into: u32, from: u32},
+    Merge{into: i32, from: i32},
+    Output{fd: i32, sink: Box<ExprS>},
+    Input{fd: i32, source: Box<ExprS>},
+    Heredoc{expr: Box<ExprS>},
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -221,14 +224,15 @@ pub enum Expr {
     String(String),
     LString(String),
     XString(Vec<ExprS>),
+    Hereval(Box<ExprS>),
     Exec(SubsMode, Box<ExprS>, Vec<ManOp>),
     ExecList(SubsMode, Box<ExprS>, Vec<ManOp>),
     Call(SubsMode, Box<ExprS>, Vec<ManOp>),
     Var(SubsMode, Box<ExprS>),
     Block(Vec<ExprS>),
     Lambda(Vec<(String, Option<ExprS>)>, Pat, RefCell<Option<Vec<ExprS>>>),
-    Pipe(Vec<ExprS>, Option<Box<ExprS>>),
-    Manip(ManOp, Box<ExprS>),
+    Pipe(Vec<ExprS>),
+    Manip(Vec<ManOp>, Box<ExprS>),
     Let(Pat, Box<ExprS>),
     Read(Vec<ExprS>),
     Recv(Pat),
@@ -244,6 +248,7 @@ pub enum Expr {
     ForIter{pat: Pat, iter: Box<ExprS>, lo: Vec<ExprS>},
     Match{val: Box<ExprS>, cases: Vec<(Pat, ExprS)>},
     MatchAll{val: Box<ExprS>, cases: Vec<(Pat, ExprS)>},
+    Consume{val: Box<ExprS>, cases: Vec<(Pat, ExprS)>},
     Index(SubsMode, Box<ExprS>, Box<ExprS>),
     Member(SubsMode, Box<ExprS>, Box<ExprS>),
     Range(ASTRange),
@@ -390,11 +395,11 @@ impl ExprS {
                     Err(e) => Err(InvalidPattern(ExprS(e, lspan), "Invalid as lhs of assignment pattern")),
                 }
             },
-            Pipe(v, None) => {
+            Pipe(v) => {
                 if let Some(v) = require_string_pipe_list(&v) {
                     Ok(StrList(v))
                 } else {
-                    Err(InvalidPattern(ExprS(Pipe(v, None), span), "Invalid as pattern; pipes must separate literal strings"))
+                    Err(InvalidPattern(ExprS(Pipe(v), span), "Invalid as pattern; pipes must separate literal strings"))
                 }
             },
             Expr::Rex(r) => Ok(Pat::Rex(r)),
@@ -427,10 +432,20 @@ impl ExprS {
     pub fn is_callable(&self) -> bool {
         use self::Expr::*;
         match self.0 {
-            Tuple(..) | Ident(..) | String(..) | LString(..) | XString(..) | Exec(..) | ExecList(..) | Call(..) | Var(..) | Lambda(..) => {
+            Tuple(..) | Ident(..) | String(..) | LString(..) | XString(..) | Exec(..) | ExecList(..) | Call(..) | Var(..) | Lambda(..) | Hereval(..) => {
                 true
             },
             _ => false
+        }
+    }
+
+    pub fn apply_manip(self, o: ManOp) -> ExprS {
+        if let ExprS(Expr::Manip(mut v, e), span) = self {
+            v.push(o);
+            ExprS(Expr::Manip(v, e), span)
+        } else {
+            let span = self.1;
+            ExprS(Expr::Manip(vec![o], Box::new(self)), span)
         }
     }
 }
@@ -614,59 +629,61 @@ impl fmt::Debug for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::Expr::*;
 
-        match self {
-            &Ident(ref s) => write!(f, "{}", s),
-            &String(ref s) => write!(f, "\"{}\"", s),
-            &LString(ref s) => write!(f, "\'{}\'", s),
-            &XString(ref s) => write!(f, "\"XString{:?}\"", s),
-            &Exec(ref m, ref s, _) => write!(f, "Exec<{:#?}>{{{:#?}}}", m, s),
-            &ExecList(ref m, ref s, _) => write!(f, "ExecList<{:#?}>{{{:#?}}}", m, s),
-            &Call(ref m, ref s, _) => write!(f, "Call<{:#?}>{{{:#?}}}", m, s),
-            &If{cond: ref c, then: ref t, el: ref e} => write!(f, "If({:#?}, {:#?}, {:#?})", c, t, e),
-            &While{cond: ref c, lo: ref l} => write!(f, "While({:#?}, {:#?})", c, l),
-            &For{pat: ref p, val: ref i, lo: ref l} => write!(f, "For({:#?} in {:#?}, {:#?})", p, i, l),
-            &ForIter{pat: ref p, iter: ref i, lo: ref l} => write!(f, "For({:#?} in {:#?}, {:#?})", p, i, l),
-            &Match{val: ref v, cases: ref c} => write!(f, "Match({:#?}){:#?}", v, c),
-            &MatchAll{val: ref v, cases: ref c} => write!(f, "MatchAll({:#?}){:#?}", v, c),
-            &Var(ref m, ref s) => write!(f, "Var<{:#?}>{{{:#?}}}", m, s),
-            &Block(ref r) => {
+        match *self {
+            Ident(ref s) => write!(f, "{}", s),
+            String(ref s) => write!(f, "\"{}\"", s),
+            LString(ref s) => write!(f, "\'{}\'", s),
+            XString(ref s) => write!(f, "\"XString{:?}\"", s),
+            Hereval(ref s) => write!(f, "Hereval({:?})", s),
+            Exec(ref m, ref s, _) => write!(f, "Exec<{:#?}>{{{:#?}}}", m, s),
+            ExecList(ref m, ref s, _) => write!(f, "ExecList<{:#?}>{{{:#?}}}", m, s),
+            Call(ref m, ref s, _) => write!(f, "Call<{:#?}>{{{:#?}}}", m, s),
+            If{cond: ref c, then: ref t, el: ref e} => write!(f, "If({:#?}, {:#?}, {:#?})", c, t, e),
+            While{cond: ref c, lo: ref l} => write!(f, "While({:#?}, {:#?})", c, l),
+            For{pat: ref p, val: ref i, lo: ref l} => write!(f, "For({:#?} in {:#?}, {:#?})", p, i, l),
+            ForIter{pat: ref p, iter: ref i, lo: ref l} => write!(f, "For({:#?} in {:#?}, {:#?})", p, i, l),
+            Match{val: ref v, cases: ref c} => write!(f, "Match({:#?}){:#?}", v, c),
+            MatchAll{val: ref v, cases: ref c} => write!(f, "MatchAll({:#?}){:#?}", v, c),
+            Consume{val: ref v, cases: ref c} => write!(f, "Consume({:#?}){:#?}", v, c),
+            Var(ref m, ref s) => write!(f, "Var<{:#?}>{{{:#?}}}", m, s),
+            Block(ref r) => {
                 //let Func{args: ref a, body: ref b} = *r.deref();
                 write!(f, "{{{:#?}}}", r)
             },
-            &Lambda(ref c, ref p, ref r) => {
+            Lambda(ref c, ref p, ref r) => {
                 //let Func{args: ref a, body: ref b} = *r.deref();
                 write!(f, "{{[{:#?}]|{:#?}| {:#?}}}", c, p, r.borrow())
             },
-            &Pipe(ref p, ref q) => write!(f, "Pipe({:#?}, {:#?})", p, q),
-            &Let(ref l, ref r) => write!(f, "Let({:#?} = {:#?})", l, r),
-            &Read(ref p) => write!(f, "Read({:#?})", p),
-            &Recv(ref p) => write!(f, "Recv({:#?})", p),
-            &Set(o, ref l, ref r) => write!(f, "{:#?}({:#?} = {:#?})", o, l, r),
-            &Import(s, ref l, ref o, ref r, ref i) => write!(f, "Import({:#?} {:#?} : {:#?} <{:#?}> = {:#?})", s, r, l, o, i),
-            &Index(_, ref n, ref i) => write!(f, "Index({:#?}[{:#?}])", n, i),
-            &Member(_, ref l, ref r) => write!(f, "({:#?}$.{:#?})", l, r),
-            &And(ref l, ref r) => write!(f, "({:#?} && {:#?})", l, r),
-            &Or(ref l, ref r) => write!(f, "({:#?} || {:#?})", l, r),
-            &FuncDec(ref p, ref b) => write!(f, "fn {:#?} {:#?}", p, b),
-            &Manip(ref m, ref e) => write!(f, "Manip({:#?}, {:#?})", m, e),
-            &Background(ref s) => write!(f, "Background({:#?})", s),
-            &Range(ref r) => write!(f, "Range({:#?})", r),
-            &Break(ref e) => write!(f, "Break({:#?})", e),
-            &Continue(ref e) => write!(f, "Continue({:#?})", e),
-            &Return(ref e) => write!(f, "Return({:#?})", e),
-            &Tuple(TupleStyle::Spaced, ref v) => {
+            Pipe(ref p) => write!(f, "Pipe({:#?})", p),
+            Let(ref l, ref r) => write!(f, "Let({:#?} = {:#?})", l, r),
+            Read(ref p) => write!(f, "Read({:#?})", p),
+            Recv(ref p) => write!(f, "Recv({:#?})", p),
+            Set(o, ref l, ref r) => write!(f, "{:#?}({:#?} = {:#?})", o, l, r),
+            Import(s, ref l, ref o, ref r, ref i) => write!(f, "Import({:#?} {:#?} : {:#?} <{:#?}> = {:#?})", s, r, l, o, i),
+            Index(_, ref n, ref i) => write!(f, "Index({:#?}[{:#?}])", n, i),
+            Member(_, ref l, ref r) => write!(f, "({:#?}$.{:#?})", l, r),
+            And(ref l, ref r) => write!(f, "({:#?} && {:#?})", l, r),
+            Or(ref l, ref r) => write!(f, "({:#?} || {:#?})", l, r),
+            FuncDec(ref p, ref b) => write!(f, "fn {:#?} {:#?}", p, b),
+            Manip(ref m, ref e) => write!(f, "Manip({:#?}, {:#?})", m, e),
+            Background(ref s) => write!(f, "Background({:#?})", s),
+            Range(ref r) => write!(f, "Range({:#?})", r),
+            Break(ref e) => write!(f, "Break({:#?})", e),
+            Continue(ref e) => write!(f, "Continue({:#?})", e),
+            Return(ref e) => write!(f, "Return({:#?})", e),
+            Tuple(TupleStyle::Spaced, ref v) => {
                 write!(f, "TupS{:#?}", v)
             }
-            &Tuple(TupleStyle::Comma, ref v) => {
+            Tuple(TupleStyle::Comma, ref v) => {
                 write!(f, "TupC{:#?}", v)
             }
-            &Tuple(TupleStyle::Named, ref v) => {
+            Tuple(TupleStyle::Named, ref v) => {
                 write!(f, "{:#?}{:#?}", &v[0], &v[1..])
             }
-            &Rex(RegexEq(ref r)) => {
+            Rex(RegexEq(ref r)) => {
                 write!(f, "/{:?}/", r.as_str())
             }
-            &Nop => write!(f, "Nop"),
+            Nop => write!(f, "Nop"),
         }
     }
 }

@@ -74,7 +74,7 @@ fn job2val(job: ::jobs::Job) -> Val {
                 _ => unreachable!(),
             }
         },
-        Background(pid, jid, status) => {
+        Background(pid, jid, _status) => {
             Tup(vec![Str("Suspended".into()), Str(jid.to_string()),
                      Tup(vec![Val::str("Pid"), Str(i32::from(pid).to_string())])])
         },
@@ -86,7 +86,7 @@ pub fn system(interp: &mut Interp, val: &Val) -> Val {
     use ::std::iter::IntoIterator;
 
     let cmd = val.iter().flatten();
-    let mut iter = cmd.take_tup().unwrap().into_iter().map(|x| x.take_str().unwrap());
+    let iter = cmd.take_tup().unwrap().into_iter().map(|x| x.take_str().unwrap());
     interp.jobs.exec_fg(iter.collect()).map(|x| job2val(x)).unwrap_or(Val::err_str("bad exec"))
     /*
     let status = Command::new(iter.next().expect("system requires at least one argument")).args(iter).status();

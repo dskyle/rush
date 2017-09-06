@@ -1,12 +1,13 @@
 use ast::{ExprS, Span, Pos, Expr, TupleStyle, SubsMode, ImportScope, SetOp,
           ManOp, ASTRange};
 
-use lex::Tok;
+use lex::{Tok, HereRef, HereStatus};
 use rush_pat::pat::{Pat, RegexEq};
 use regex::Regex;
 
 use lex::Tok::*;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError {
@@ -95,12 +96,8 @@ parser! {
             if p.len() == 1 {
                 Ok(p.pop().unwrap())
             } else {
-                Ok(ExprS(Expr::Pipe(p, None), span!()))
+                Ok(ExprS(Expr::Pipe(p), span!()))
             }
-        },
-        pipeline[p] Gt nl expr[f] => {
-            let p = p?;
-            Ok(ExprS(Expr::Pipe(p, Some(Box::new(f?))), span!()))
         },
     }
 
@@ -110,20 +107,21 @@ parser! {
         pipeline[p] Pipe Amp nl call[e] ws => {
             let mut p = p?;
             let last = p.pop().unwrap();
-            let last_span = last.1;
-            p.push(ExprS(Expr::Manip(ManOp::Merge{into: 1, from: 2},
-                                     Box::new(last)), last_span));
+            p.push(last.apply_manip(ManOp::Merge{into: 1, from: 2}));
             p.push(e?); Ok(p)
         }
     }
 
     call: Res<ExprS> {
         expr[e] => e,
-        call[c] ws manop[f] => Ok(ExprS(Expr::Manip(f?, Box::new(c?)), span!())),
+        call[c] ws manop[f] => Ok(c?.apply_manip(f?)),
     }
 
     manop: Res<ManOp> {
-        Redir(from, to) => Ok(ManOp::Merge{from: from as u32, into: to as u32}),
+        Redir(from, to) => Ok(ManOp::Merge{from: from as i32, into: to as i32}),
+        Gt nl expr[f] ws => Ok(ManOp::Output{fd: 1, sink: Box::new(f?)}),
+        Lt nl expr[f] ws => Ok(ManOp::Input{fd: 0, source: Box::new(f?)}),
+        Heredoc(href) ws => Ok(ManOp::Heredoc{expr: process_hereobj(href, span!())}),
     }
 
     expr: Res<ExprS> {
@@ -146,8 +144,8 @@ parser! {
     }*/
 
     ws_tuple_val: Res<ExprS> {
-        #[no_reduce(Range, Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare,
-                    Read, Recv, If, While, For, Match, MatchAll, LambdaOpen)]
+        #[no_reduce(Range, Ident, Hereval, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare,
+                    Read, Recv, If, While, For, Match, MatchAll, Consume, LambdaOpen)]
         ws_tuple[tup] => {
             let mut tup = tup?;
             if tup.len() == 1 {
@@ -230,6 +228,10 @@ parser! {
         },
     }
 
+    hereval: Res<ExprS> {
+        Hereval(href) => Ok(ExprS(Expr::Hereval(process_hereobj(href, span!())), span!())),
+    }
+
     regex: Res<ExprS> {
         Rex(s) => Ok(ExprS(Expr::Rex(RegexEq(Regex::new(&s).map_err(|e| InvalidRegex(span!(), s.clone(), format!("{}", e)))?)), span!())),
     }
@@ -238,13 +240,13 @@ parser! {
         #[no_reduce(Range)]
         atom_val[a] ws => a,
 
-        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
+        #[no_reduce(Ident, Hereval, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
         Range ws => Ok(ExprS(Expr::Range(ASTRange::All), span!())),
 
-        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
+        #[no_reduce(Ident, Hereval, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
         atom_val[a] ws Range ws => Ok(ExprS(Expr::Range(ASTRange::From(Box::new(a?))), span!())),
 
-        #[no_reduce(Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
+        #[no_reduce(Ident, Hereval, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare, LambdaOpen)]
         val[a] ws Range ws => Ok(ExprS(Expr::Range(ASTRange::From(Box::new(a?))), span!())),
 
         Range ws atom_val[a] ws => Ok(ExprS(Expr::Range(ASTRange::Till(Box::new(a?))), span!())),
@@ -256,7 +258,7 @@ parser! {
     }
 
     atom_val: Res<ExprS> {
-        #[no_reduce(Ident, Rex, NakedString, SingleString, DoubleString, Var, VarLBrace, Exec, ExecLParen, ExecLSquare)]
+        #[no_reduce(Ident, Hereval, Rex, NakedString, SingleString, DoubleString, Var, VarLBrace, Exec, ExecLParen, ExecLSquare)]
         atom_seq[a] => {
             let a = a?;
             if let ExprS(Expr::XString(v), _) = a {
@@ -296,6 +298,7 @@ parser! {
         regex[r] => r,
         var_ref[vr] => vr,
         exec[ex] => ex,
+        hereval[hv] => hv,
     }
 
     ws_tuple: Res<Vec<ExprS>> {
@@ -309,8 +312,8 @@ parser! {
     }
 
     comma_tuple: Res<Vec<ExprS>> {
-        #[no_reduce(Range, Ident, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen,
-                    ExecLSquare, Read, Recv, If, While, For, Match, MatchAll, LambdaOpen)]
+        #[no_reduce(Range, Ident, Hereval, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen,
+                    ExecLSquare, Read, Recv, If, While, For, Match, MatchAll, Consume, LambdaOpen)]
         member[a] ws Comma ws => Ok(vec![a?]),
 
         #[no_reduce(Comma, LSquare, Member)]
@@ -520,7 +523,7 @@ parser! {
     }
 
     for_rule: Res<ExprS> {
-        For ws expr[bind] nl Colon nl subexpr[iter] nl block[lo] ws => {
+        For ws expr[bind] nl In nl subexpr[iter] nl block[lo] ws => {
             let pat = ExprS::to_pat(bind?)?;
             let iter = iter?;
             let iter_span = iter.1;
@@ -534,7 +537,7 @@ parser! {
             }
         },
 
-        For ws expr[bind] nl DoubleColon nl subexpr[iter] nl block[lo] ws => {
+        For ws expr[bind] nl Using nl subexpr[iter] nl block[lo] ws => {
             let pat = ExprS::to_pat(bind?)?;
             Ok(ExprS(Expr::ForIter{pat: pat, iter: Box::new(iter?), lo: lo?}, span!()))
         },
@@ -601,7 +604,6 @@ parser! {
     options: Res<ExprS> {
         LSquare nl RSquare ws => Ok(ExprS(Expr::String(" ".into()), span!())),
         LSquare nl subexpr[e] nl RSquare ws => e,
-        LSquare nl Colon nl RSquare ws => Ok(ExprS(Expr::String(":".into()), span!())),
     }
 
     set_rule: Res<ExprS> {
@@ -620,16 +622,16 @@ parser! {
         scope[s] nl options[o] nl ident[i] ws set_op[op] nl expr[e] ws =>
             Ok(ExprS::import_set(s, i?, Some(o?), op, e?, span!())),
 
-        scope[s] nl ident[a] ws Colon nl ident[i] ws =>
+        scope[s] nl ident[i] ws As nl ident[a] ws =>
             Ok(ExprS::import_as(s, i?, None, a?, span!())),
 
-        scope[s] nl options[o] nl ident[a] ws Colon nl ident[i] ws =>
+        scope[s] nl options[o] nl ident[i] ws As nl ident[a] ws =>
             Ok(ExprS::import_as(s, i?, Some(o?), a?, span!())),
 
-        scope[s] nl ident[a] ws Colon nl ident[i] ws set_op[op] nl expr[e] ws=>
+        scope[s] nl ident[i] ws As nl ident[a] ws set_op[op] nl expr[e] ws=>
             Ok(ExprS::import_as_and_set(s, i?, None, a?, op, e?, span!())),
 
-        scope[s] nl options[o] nl ident[a] ws Colon nl ident[i] ws set_op[op] nl expr[e] ws=>
+        scope[s] nl options[o] nl ident[i] ws As nl ident[a] ws set_op[op] nl expr[e] ws=>
             Ok(ExprS::import_as_and_set(s, i?, Some(o?), a?, op, e?, span!())),
     }
 
@@ -660,22 +662,32 @@ parser! {
     }
 
     match_one: Res<(Pat, ExprS)> {
-        expr[e] ws Into ws stmt3[b] ws => {
+        expr[e] ws Into ws block_expr[b] ws match_sep ws => {
             Ok((ExprS::to_pat(e?)?, b?))
         }
-        //expr[e] ws Into ws block[b] ws => {
-            //Ok((ExprS::to_pat(e?)?, b?))
-        //}
+
+        expr[e] ws Into ws ws_tuple_val[t] ws Comma ws => {
+            Ok((ExprS::to_pat(e?)?, t?))
+        }
+
+        expr[e] ws Into ws control_flow[t] ws Comma ws => {
+            Ok((ExprS::to_pat(e?)?, t?))
+        }
+    }
+
+    match_sep: () {
+        Comma nl => (),
+        => (),
     }
 
     match_list: Res<Vec<(Pat, ExprS)>> {
         match_one[l] => Ok(vec![l?]),
-        match_list[m] nl Comma nl match_one[l] => { let mut m = m?; m.push(l?); Ok(m) }
+        match_list[m] nl match_one[l] => { let mut m = m?; m.push(l?); Ok(m) }
     }
 
     match_block: Res<Vec<(Pat, ExprS)>> {
         LBrace nl match_list[l] nl RBrace ws => l,
-        LBrace nl match_list[l] nl Comma nl RBrace ws => l,
+        //LBrace nl match_list[l] nl Comma nl RBrace ws => l,
     }
 
     match_rule: Res<ExprS> {
@@ -684,6 +696,9 @@ parser! {
 
         MatchAll nl subexpr[i] nl match_block[n] ws =>
             Ok(ExprS(Expr::MatchAll{val: Box::new(i?), cases: n?}, span!())),
+
+        Consume nl subexpr[i] nl match_block[n] ws =>
+            Ok(ExprS(Expr::Consume{val: Box::new(i?), cases: n?}, span!())),
     }
 
     control_flow: Res<ExprS> {
@@ -923,6 +938,30 @@ fn process_xstring(s: String, esc: bool, span: Span) -> Vec<ExprS> {
     }
     xstring_ensure_last_is_str(&mut ret);
     return ret;
+}
+
+fn process_hereobj(here: HereRef, span: Span) -> Box<ExprS> {
+    if let Ok(here) = Rc::try_unwrap(here) {
+        let here = here.into_inner();
+        if let HereStatus::Complete{text} = here.status {
+            match text {
+                Tok::SingleString(s) => Box::new(ExprS::lstring(s, span)),
+                Tok::DoubleString(s, esc) => {
+                    let v = process_xstring(s, esc, span);
+                    if v.len() == 1 {
+                        Box::new(v.into_iter().nth(0).unwrap())
+                    } else {
+                        Box::new(ExprS(Expr::XString(v), span))
+                    }
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            unimplemented!();
+        }
+    } else {
+        unimplemented!();
+    }
 }
 
 fn make_member(l: ExprS, m: String, r: ExprS, span: Span) -> Res<ExprS> {

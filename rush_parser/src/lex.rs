@@ -1,8 +1,10 @@
 use ast::{Pos, Span};
 use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::rc::Rc;
 use regex::Regex;
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Tok {
     Ident(String),
     NakedString(String),
@@ -17,8 +19,6 @@ pub enum Tok {
     Comma,
     Semi,
     Range,
-    Colon,
-    DoubleColon,
     Pipe,
     LambdaOpen,
     Amp,
@@ -33,14 +33,18 @@ pub enum Tok {
     Let,
     Global,
     Sys,
+    As,
     Read,
     Recv,
     If,
     Else,
     While,
     For,
+    In,
+    Using,
     Match,
     MatchAll,
+    Consume,
     Return,
     Break,
     Continue,
@@ -58,7 +62,8 @@ pub enum Tok {
     ExecLSquare(String),
     Redir(u8, u8),
     Rex(String),
-    Heredoc(bool, bool, bool, String),
+    Heredoc(HereRef),
+    Hereval(HereRef),
     Error(String),
 }
 
@@ -91,9 +96,30 @@ impl Tok {
         body.push('\n');
         body.push_str(s);
         body.push('\n');
-        Tok::Heredoc(as_val, do_subst, trim_ws, body)
+        let ret = Rc::new(RefCell::new(HereObj{status: HereStatus::Pending{ending: body, text: String::new()}, span: Span::zero(), do_subst, trim_ws}));
+        if as_val {
+            Tok::Hereval(ret)
+        } else {
+            Tok::Heredoc(ret)
+        }
     }
 }
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum HereStatus {
+    Pending{ending: String, text: String},
+    Complete{text: Tok},
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HereObj {
+    pub status: HereStatus,
+    pub span: Span,
+    pub do_subst: bool,
+    pub trim_ws: bool,
+}
+
+pub type HereRef = Rc<RefCell<HereObj>>;
 
 lexer! {
     fn take_token(text: 'a) -> Tok;
@@ -107,15 +133,19 @@ lexer! {
     r##"let"## => Tok::Let,
     r##"global"## => Tok::Global,
     r##"sys"## => Tok::Sys,
+    r##"as"## => Tok::As,
     r##"read"## => Tok::Read,
     r##"recv"## => Tok::Recv,
     r##"if"## => Tok::If,
     r##"else"## => Tok::Else,
     r##"while"## => Tok::While,
     r##"for"## => Tok::For,
+    r##"in"## => Tok::In,
+    r##"using"## => Tok::Using,
     r##"fn"## => Tok::Func,
     r##"match"## => Tok::Match,
     r##"match_all"## => Tok::MatchAll,
+    r##"consume"## => Tok::Consume,
     r##"break"## => Tok::Break,
     r##"continue"## => Tok::Continue,
     r##"return"## => Tok::Return,
@@ -126,8 +156,6 @@ lexer! {
     r##"\?="## => Tok::AssignIfNull,
     r##"\+="## => Tok::Suffix,
     r##"^="## => Tok::Prefix,
-    r##":"## => Tok::Colon,
-    r##"::"## => Tok::DoubleColon,
     r##","## => Tok::Comma,
     r##";"## => Tok::Semi,
     r##"\.\.\."## => Tok::Range,
@@ -153,8 +181,8 @@ lexer! {
     r##"\$(|,|-|,-|-,)[_a-zA-Z][_a-zA-Z0-9]*(::[_a-zA-Z][_a-zA-Z0-9]*)*"## => Tok::VarIdent(text.into()),
     r##"\$(|,|-|,-|-,)"## => Tok::Var(text.into()),
 
-    r##"(|\$)<<(|-)[_a-zA-Z0-9]+[ \t\r]*(|\n)"## => Tok::mk_heredoc(text),
-    r##"(|\$)<<(|-)'[_a-zA-Z0-9]+'[ \t\r]*(|\n)"## => Tok::mk_heredoc(text),
+    r##"(|\$)<<(|-)[_a-zA-Z0-9]+"## => Tok::mk_heredoc(text),
+    r##"(|\$)<<(|-)'[_a-zA-Z0-9]+'"## => Tok::mk_heredoc(text),
     r##"'([^'])*'"## => Tok::SingleString(text.trim_matches('\'').into()),
     r##""([^\\"]|\\"|\\.)*""## => Tok::DoubleString(text[1..(text.len() - 1)].into(), true),
     r##"$/([^\\/]|\\/|\\.)*/"## => Tok::Rex(text[2..(text.len() - 1)].into()),
@@ -171,7 +199,7 @@ lexer! {
     //r##"[_a-zA-Z][_a-zA-Z0-9]*"## => Tok::Ident(text.into()),
     r##"[_a-zA-Z][_a-zA-Z0-9]*(::[_a-zA-Z][_a-zA-Z0-9]*)*"## => Tok::Ident(text.into()),
     //r##"[_a-zA-Z][_a-zA-Z0-9]*(::[_a-zA-Z][_a-zA-Z0-9]*)*\.[_a-zA-Z][_a-zA-Z0-9]*"## => Tok::Ident(text.into()),
-    r##"[^ \r\t\n"'\\\$\(\)\{\}\[\]&|,;]+"## => Tok::NakedString(text.into()),
+    r##"[^ \r\t\n"'\\\$\(\)\{\}\[\]&|<>,;]+"## => Tok::NakedString(text.into()),
     r##"\\ "## => Tok::SingleString(" ".into()),
     r##"\\."## => Tok::DoubleString(text.into(), true),
 
@@ -200,24 +228,25 @@ enum KWAllow {
     No,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ContextLexer {
-    context : Vec<(char, bool)>,
-    line : usize,
-    pos : usize,
-    kw : KWAllow,
-    heredoc : Option<(Tok, Span, String)>,
+    context: Vec<(char, bool)>,
+    line: usize,
+    pos: usize,
+    kw: KWAllow,
+    heredocs: VecDeque<HereRef>,
+    process_heredocs: bool,
 }
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ContextLexerIterator<'a, 'b> {
-    lexer : &'a mut ContextLexer,
-    input : &'b str,
-    override_queue : VecDeque<(Tok, Span)>,
+    lexer: &'a mut ContextLexer,
+    input: &'b str,
+    override_queue: VecDeque<(Tok, Span)>,
 }
 
 impl<'a> ContextLexer {
-    pub fn new() -> ContextLexer { ContextLexer { context: vec![], line: 1, pos: 1, kw: KWAllow::All, heredoc: None } }
+    pub fn new() -> ContextLexer { ContextLexer { context: vec![], line: 1, pos: 1, kw: KWAllow::All, heredocs: VecDeque::new(), process_heredocs: false } }
 
     pub fn lex<'b>(&'a mut self, input : &'b str) -> ContextLexerIterator<'a, 'b> {
         ContextLexerIterator::<'a, 'b>{lexer: self, input: input, override_queue: VecDeque::new()}
@@ -242,12 +271,12 @@ impl<'a> ContextLexer {
     }
 
     pub fn suppress_newlines(&self) -> bool {
-        if self.heredoc.is_some() { return false; }
+        if self.process_heredocs { return false; }
         self.context.last().map(|x| x.1).unwrap_or(false)
     }
 
     pub fn complete(&'a self) -> bool {
-        if self.heredoc.is_some() { return false; }
+        if self.process_heredocs || self.heredocs.len() > 0 { return false; }
         for c in self.context.iter() {
             if c.0 != '=' {
                 return false;
@@ -352,6 +381,71 @@ impl<'a, 'b> ContextLexerIterator<'a, 'b> {
             None
         }
     }
+
+    fn do_heredocs(&mut self) -> bool {
+        while self.input.len() > 0 {
+            if let Some(hereref) = self.lexer.heredocs.front() {
+                let mut hereobj = hereref.borrow_mut();
+                let HereObj{ref mut status, span: _, do_subst, trim_ws} = *hereobj;
+                let mut new_status = None;
+                if let HereStatus::Pending{ref ending, ref mut text} = *status {
+                    use self::ChainedFindResult::*;
+
+                    fn mk_new_status(text: &mut String, do_subst: bool, trim_ws: bool) -> HereStatus {
+                        let text = ::std::mem::replace(text, String::new());
+                        let text = if trim_ws {
+                            trim_all_leading_ws(text)
+                        } else { text };
+                        let text = if do_subst {
+                            Tok::DoubleString(text, true)
+                        } else {
+                            Tok::SingleString(text)
+                        };
+                        HereStatus::Complete{text}
+                    }
+
+                    //eprintln!("'{:?}'   '{:?}'   '{:?}'", text, self.input, ending);
+                    let ending = if text.len() == 0 { &ending[1..] } else { ending };
+                    match chained_find(text, self.input, ending) {
+                        NotFound => {
+                            //eprintln!("Not found");
+                            text.push_str(self.input);
+                            self.input = &self.input[(self.input.len())..];
+                            return false;
+                        },
+                        OnlyFirst(_) => {
+                            unreachable!();
+                        },
+                        Spanning(i) => {
+                            //eprintln!("Spanning {:?}", i);
+                            let l = text.len() - i;
+                            text.truncate(l);
+                            self.input = &self.input[(ending.len() - i)..];
+                            new_status = Some(mk_new_status(text, do_subst, trim_ws));
+                        },
+                        OnlyLast(i) => {
+                            //eprintln!("OnlyLast {:?}", i);
+                            text.push_str(&self.input[0..i]);
+                            self.input = &self.input[(i + ending.len())..];
+                            new_status = Some(mk_new_status(text, do_subst, trim_ws));
+                        },
+                    }
+                }
+                if let Some(new_status) = new_status {
+                    *status = new_status;
+                }
+            } else {
+                break;
+            }
+            self.lexer.heredocs.pop_front();
+        }
+        if self.lexer.heredocs.len() == 0 {
+            self.lexer.process_heredocs = false;
+            return true;
+        } else {
+            return false;
+        }
+    }
 }
 
 enum ChainedFindResult {
@@ -389,46 +483,10 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
     type Item = (Tok, Span);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some((Tok::Heredoc(as_val, do_subst, trim_ws, body), span, mut s)) = self.lexer.heredoc.take() {
-            use self::ChainedFindResult::*;
-
-            fn finalize(as_val: bool, do_subst: bool, trim_ws: bool, s: String) -> Tok {
-                if as_val {
-                    if do_subst {
-                        Tok::DoubleString(s, false)
-                    } else {
-                        Tok::SingleString(s)
-                    }
-                } else {
-                    Tok::Heredoc(as_val, do_subst, trim_ws, s)
-                }
-            }
-
-            match chained_find(&s, self.input, &body) {
-                NotFound => {
-                    s.push_str(self.input);
-                    self.input = &self.input[(self.input.len())..];
-                    self.lexer.heredoc = Some((Tok::Heredoc(as_val, do_subst, trim_ws, body), span, s));
-                    return None;
-                },
-                OnlyFirst(_) => {
-                    unreachable!();
-                },
-                Spanning(i) => {
-                    let l = s.len() - i;
-                    s.truncate(l);
-                    self.input = &self.input[(body.len() - i)..];
-                    let s = if trim_ws { trim_all_leading_ws(s) } else {s};
-                    return Some((finalize(as_val, do_subst, trim_ws, s), span));
-                },
-                OnlyLast(i) => {
-                    s.push_str(&self.input[0..i]);
-                    self.input = &self.input[(i + body.len())..];
-                    let s = if trim_ws { trim_all_leading_ws(s) } else {s};
-                    return Some((finalize(as_val, do_subst, trim_ws, s), span));
-                },
-            }
+        if self.lexer.process_heredocs {
+            self.do_heredocs();
         }
+
         let (tok, span) = if let Some(o) = self.override_queue.pop_back() {
             o
         } else {
@@ -499,14 +557,14 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
             },
 
             Tok::NewLine(..) => {
-                next_kw = Let;
+                next_kw = All;
                 if self.lexer.does_expect('=') {
                     self.lexer.context.pop();
                 }
             },
 
             Tok::Comment(..) => {
-                next_kw = Let;
+                next_kw = All;
             },
 
             Tok::Assign => {
@@ -520,7 +578,7 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
                 if self.lexer.does_expect('=') {
                     self.lexer.context.pop();
                 }
-                next_kw = Let;
+                next_kw = All;
             },
 
             Tok::AssignIfNull | Tok::Suffix |
@@ -531,18 +589,19 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
 
             Tok::Let | Tok::Global | Tok::Sys => { next_kw = Assign },
 
-            Tok::For | Tok::Func | Tok::Match | Tok::MatchAll | Tok::Comma |
-                Tok::Break | Tok::Continue | Tok::Return |
+            Tok::For | Tok::Func | Tok::Match | Tok::MatchAll | Tok::Consume |
+                Tok::Comma | Tok::Break | Tok::Continue | Tok::Return |
                 Tok::Gt | Tok::Lt |
                 Tok::Var(_) | Tok::VarIdent(_) | Tok::Exec(_) | Tok::Redir(_, _) |
                 Tok::Ident(_) | Tok::NakedString(_) | Tok::Range |
                 Tok::SingleString(_) | Tok::DoubleString(..) |
                 Tok::Rex(_) | Tok::Read | Tok::Recv | Tok::LambdaOpen |
-                Tok::Member(..) | Tok::Colon | Tok::DoubleColon =>
+                Tok::Member(..) | Tok::In | Tok::Using | Tok::As |
+                Tok::Heredoc(..) | Tok::Hereval(..) =>
                     { next_kw = No; },
 
             Tok::Error(_) => {},
-            Tok::Whitespace | Tok::Amp | Tok::Heredoc(..) => {},
+            Tok::Whitespace | Tok::Amp => {},
         }
 
         let tok = match kw {
@@ -559,6 +618,7 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
                 Tok::Func => Tok::Ident("fn".into()),
                 Tok::Match => Tok::Ident("match".into()),
                 Tok::MatchAll => Tok::Ident("match_all".into()),
+                Tok::Consume => Tok::Ident("consume".into()),
                 Tok::Break => Tok::Ident("break".into()),
                 Tok::Continue => Tok::Ident("continue".into()),
                 Tok::Return => Tok::Ident("return".into()),
@@ -568,6 +628,18 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
                 _ => tok,
             }
         };
+
+        match tok {
+            Tok::Heredoc(ref hereref) | Tok::Hereval(ref hereref) =>
+                self.lexer.heredocs.push_back(hereref.clone()),
+            Tok::NewLine(..) => {
+                if self.lexer.heredocs.len() > 0 {
+                    self.lexer.process_heredocs = true;
+                    self.do_heredocs();
+                }
+            }
+            _ => {},
+        }
 
         let tok = loop { match tok {
             Tok::Let | Tok::Sys | Tok::Global => {
@@ -597,18 +669,25 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
                 self.override_queue.push_front((Tok::Ident(right.into()), span));
                 break Tok::Var(left.into())
             },
-            Tok::Colon => {
+            Tok::In => {
                 if self.lexer.does_expect(':') {
                     self.lexer.context.pop();
                 } else {
-                    break Tok::NakedString(":".into())
+                    break Tok::NakedString("in".into())
                 }
             },
-            Tok::DoubleColon => {
+            Tok::Using => {
                 if self.lexer.does_expect(':') {
                     self.lexer.context.pop();
                 } else {
-                    break Tok::NakedString("::".into())
+                    break Tok::NakedString("using".into())
+                }
+            },
+            Tok::As => {
+                if self.lexer.does_expect('=') {
+                    /* do nothing */
+                } else {
+                    break Tok::NakedString("as".into())
                 }
             },
             Tok::NewLine(..) => {
@@ -621,10 +700,7 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
 
         self.lexer.kw = next_kw;
 
-        if let Tok::Heredoc(..) = tok {
-            self.lexer.heredoc = Some((tok, span, String::new()));
-            self.next()
-        } else if let Tok::Comment(..) = tok {
+        if let Tok::Comment(..) = tok {
             self.next()
         } else {
             Some((tok, span))

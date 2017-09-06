@@ -7,7 +7,7 @@ use nix::sys::wait::{WaitStatus};
 use nix::sys::signal::{sigaction, SigSet, SigAction, SaFlags, SigHandler, Signal};
 use nix::sys::signal::{SigmaskHow, pthread_sigmask};
 use std::cell::{Cell, RefCell};
-use nix::unistd::{fork, execvp, ForkResult, tcsetpgrp, tcgetpgrp, getpgrp, setpgid, getpid};
+use nix::unistd::{fork, execvp, ForkResult, tcsetpgrp, getpgrp, setpgid, getpid};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::os::unix::io::RawFd;
@@ -113,8 +113,8 @@ impl Drop for Jobs {
 extern "C" fn forward_handler(sig: ::nix::libc::c_int) {
     let pid = ::jobs::FG_PID.load(Ordering::SeqCst);
     if pid > 0 {
-        ::nix::unistd::write(0, "forwarding signal\n".as_bytes());
-        ::nix::sys::signal::kill(Pid::from_raw(pid), Some(Signal::from_c_int(sig).unwrap()));
+        ::nix::unistd::write(0, "forwarding signal\n".as_bytes()).unwrap();
+        ::nix::sys::signal::kill(Pid::from_raw(pid), Some(Signal::from_c_int(sig).unwrap())).unwrap();
     }
 }
 
@@ -154,7 +154,7 @@ impl Jobs {
             oldint: unsafe { sigaction(Signal::SIGINT, &action).unwrap() },
             oldtstp: unsafe { sigaction(Signal::SIGTSTP, &action).unwrap() },
             oldquit: unsafe { sigaction(Signal::SIGQUIT, &action).unwrap() },
-            oldttou: unsafe { sigaction(Signal::SIGTTOU, &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::all())).unwrap() },
+            oldttou: unsafe { sigaction(Signal::SIGTTOU, &ignore).unwrap() },
         }
     }
 
@@ -174,8 +174,8 @@ impl Jobs {
     }
 
     fn init_child(&self) {
-        unblock_all_signals();
-        setpgid(Pid::from_raw(0), getpid());
+        unblock_all_signals().unwrap();
+        setpgid(Pid::from_raw(0), getpid()).unwrap();
     }
 
     pub fn spawn_bg(&mut self) -> Result<SpawnResult, Error> {
@@ -205,9 +205,9 @@ impl Jobs {
         if let Some(pid) = self.ids.remove(&id) {
             if let Some(&mut (ref mut job, ref mut dirty)) = self.jobs.get_mut(&pid) {
                 match *job {
-                    Job::Foreground(_, _, cur_status) => {
+                    Job::Foreground(_, _, _) => {
                     },
-                    Job::Background(_, jid, cur_status) => {
+                    Job::Background(_, jid, _) => {
                         *job = Job::Foreground(pid, Some(jid), None);
                         dirty.set(false);
                     },
@@ -215,7 +215,7 @@ impl Jobs {
                 }
             } else { return Err("Unknown pid".into()); }
             use nix::sys::signal;
-            signal::kill(pid, Some(signal::Signal::SIGCONT));
+            signal::kill(pid, Some(signal::Signal::SIGCONT)).unwrap();
             return Ok(self.watch(pid).unwrap());
         } else { return Err("Unknown job id".into()); }
     }
@@ -224,19 +224,19 @@ impl Jobs {
         if let Some(pid) = self.ids.remove(&id) {
             if let Some(&mut (ref mut job, ref mut dirty)) = self.jobs.get_mut(&pid) {
                 match *job {
-                    Job::Foreground(_, jid, cur_status) => {
+                    Job::Foreground(_, _, _) => {
                         let jid = if let Some(jid) = job.jid() { jid } else { self.cur_id.post_inc() };
                         *job = Job::Background(pid, jid, None);
                         dirty.set(false);
                     },
-                    Job::Background(_, jid, ref mut cur_status) => {
+                    Job::Background(_, _, ref mut cur_status) => {
                         *cur_status = None;
                     },
                     _ => unreachable!(),
                 }
             } else { return Err("Unknown pid".into()); }
             use nix::sys::signal;
-            signal::kill(pid, Some(signal::Signal::SIGCONT));
+            signal::kill(pid, Some(signal::Signal::SIGCONT)).unwrap();
             return Ok(self.watch(pid).unwrap());
         } else { return Err("Unknown job id".into()); }
     }
@@ -251,7 +251,7 @@ impl Jobs {
             let status = job.status();
             match status {
                 None | Some(StillAlive) => {},
-                Some(Exited(pid, ..)) | Some(Signaled(pid, ..)) => {
+                Some(Exited(..)) | Some(Signaled(..)) => {
                     job.set_status(status);
                     break Ok(*job);
                 },
@@ -261,11 +261,11 @@ impl Jobs {
                     self.ids.insert(jid, pid);
                     break Ok(*job);
                 },
-                Some(Continued(pid, ..)) => {
+                Some(Continued(..)) => {
                     job.set_status(status);
                 },
             }
-            ::nix::unistd::pause();
+            let _ = ::nix::unistd::pause();
         };
         tcsetpgrp(self.tty_fd, getpgrp()).unwrap();
         self.set_fg_pid(None);
@@ -279,7 +279,7 @@ impl Jobs {
                 self.watch(job.pid().unwrap())
             },
             Ok(ForkResult::Child) => {
-                let mut i = cmd.into_iter().filter_map(|x| CString::new(x.into_bytes()).ok());
+                let i = cmd.into_iter().filter_map(|x| CString::new(x.into_bytes()).ok());
                 let args: Vec<_> = i.collect();
                 let name = &args[0];
                 self.init_child();

@@ -1,9 +1,9 @@
-use rush_parser::ast::{ExprS, Expr, SetOp, ImportScope, SubsMode, Span};
+use rush_parser::ast::{ExprS, Expr, SetOp, ImportScope, SubsMode, Span, ManOp};
 use rush_pat::pat::Pat;
 use rush_rt::vars::{VarRef, LocalVars, Resolver, Binder, Scoped};
 use rush_rt::val::{Val, InternalIterable};
 use rush_rt::error::{RuntimeError};
-use rush_rt::pat::{ValMatcher};
+use rush_rt::pat::{ValMatcher, ValArray};
 use rush_rt::range::{RangeExt};
 use rush_pat::subsume::{Subsumes, Subsumption};
 use std::collections::{HashMap};
@@ -11,11 +11,9 @@ use std::borrow::{Cow, Borrow, BorrowMut};
 use func::{Control, Func, FuncBody, FuncMap};
 use std::cell::RefCell;
 use std::rc::Rc;
-use nix::unistd::{dup, dup2, close, Pid};
-use nix::sys::signal::{sigaction, SigAction, SigHandler, SaFlags, SigSet, Signal};
+use nix::unistd::{dup, dup2, close};
 use jobs::Jobs;
 use pipeline::Pipeline;
-use std::sync::atomic::Ordering;
 
 type VarMap = HashMap<String, VarRef>;
 
@@ -237,15 +235,70 @@ impl Interp {
             if pat.subsumes(&val).same_or_contains() {
                 r.enter_scope();
                 pat.do_match_unchecked((&val).into(), r);
-                let (val, con) = self.exec_stmt(body, r);
+                let (val, mut con) = self.exec_stmt(body, r);
                 r.exit_scope();
-                if con.stops_exec() {
+                if con.breaks_loops() {
+                    con.clear_breaks();
                     return (val, con)
                 }
                 ret.push(val);
             }
         }
         (Val::Tup(ret), con)
+    }
+
+    fn do_consume(&mut self, r: &mut LocalVars, e: &ExprS, cases: &Vec<(Pat, ExprS)>) -> (Val, Control) {
+        let (val, con) = self.from_expr(e, r);
+        if con.stops_exec() {
+            return (val, con)
+        }
+        if let Ok(mut vec) = val.take_tup() {
+            let mut i = 0;
+            'outer: while i < vec.len() {
+                for &(ref pat, ref body) in cases {
+                    let mut plen = pat.req_len();
+                    if pat.has_wild() {
+                        plen = vec.len() - i;
+                    }
+                    if i + plen <= vec.len() {
+                        let result = if plen == 1 {
+                            pat.subsumes(&vec[i])
+                        } else {
+                            pat.subsumes(&ValArray(&vec[i..(i + plen)]))
+                        };
+                        if result.same_or_contains() {
+                            use std::iter::repeat;
+                            let val : Vec<_> = vec.splice(i..(i + plen), repeat(Val::void()).take(plen)).collect();
+                            let val = if val.len() == 1 {
+                                val.into_iter().next().unwrap()
+                            } else {
+                                Val::Tup(val.into())
+                            };
+                            r.enter_scope();
+                            pat.do_match_unchecked(Cow::Owned(val), r);
+                            let (v, mut con) = self.exec_stmt(body, r);
+                            r.exit_scope();
+                            if con.breaks_loops() {
+                                con.clear_breaks();
+                                return (v, con)
+                            }
+                            i += plen;
+                            if con == Control::Continue {
+                                match v {
+                                    Val::Tup(vt) => {vec.splice(i..i, vt.into_iter());},
+                                    Val::Error(_) => return (v, Control::Done),
+                                    _ => {vec.insert(i, v);},
+                                }
+                            };
+                            continue 'outer;
+                        }
+                    }
+                }
+                break
+            }
+            return (Val::Tup(vec.drain(i..).collect()), Control::Done)
+        }
+        (Val::void(), Control::Done)
     }
 
     fn do_for(&mut self, r: &mut LocalVars, pat: &Pat, val: &ExprS, body: &Vec<ExprS>) -> (Val, Control) {
@@ -415,6 +468,17 @@ impl Interp {
             String(ref s) => self.do_string(s, r),
             LString(ref s) => (Str(s.clone()), Control::Done),
             XString(ref v) => self.do_xstring(v, r),
+            Hereval(ref expr) => {
+                let (val, con) = self.from_expr(&**expr, r);
+                if con.stops_exec() {
+                    return (val, con)
+                }
+                if let Ok(text) = val.take_str() {
+                    (Str(text), Control::Done)
+                } else {
+                    unimplemented!()
+                }
+            },
             Block(ref b) => {
                 r.enter_scope();
                 let res = self.exec_stmt_list(b, r);
@@ -466,6 +530,7 @@ impl Interp {
             While{ref cond, ref lo} => self.do_while(r, cond, lo),
             Match{ref val, ref cases} => self.do_match(r, val, cases),
             MatchAll{ref val, ref cases} => self.do_match_all(r, val, cases),
+            Consume{ref val, ref cases} => self.do_consume(r, val, cases),
             For{ref pat, ref val, ref lo} => self.do_for(r, pat, val, lo),
             ForIter{ref pat, ref iter, ref lo} => self.do_for_iter(r, pat, iter, lo),
             Read(ref ids) => self.do_read(ids, r),
@@ -918,7 +983,7 @@ impl Interp {
             },
             Expr::Tuple(..) | Expr::Ident(..) | Expr::String(..) | Expr::XString(..) | Expr::Range(..) |
                 Expr::LString(..) | Expr::Exec(..) | Expr::ExecList(..) | Expr::Call(..) | Expr::Var(..) | Expr::Lambda(..) |
-                Expr::Rex(..) => {
+                Expr::Rex(..) | Expr::Hereval{..} => {
                 let (val, con) = self.from_expr(stmt_s, local_vars);
                 //println!("Will call {:?} => {:?}", stmt, val);
                 if con.stops_exec() {
@@ -929,15 +994,18 @@ impl Interp {
                 }
             },
             Expr::Nop => { (Val::void(), Control::Done) },
-            Expr::If{..} | Expr::While{..} | Expr::Match{..} | Expr::MatchAll{..} | Expr::For{..} | Expr::ForIter{..} |
-                Expr::Block(..) | Expr::Read(..) | Expr::Recv(..) | Expr::Member(..) | Expr::Index(..) => {
+            Expr::If{..} | Expr::While{..} |
+                Expr::Match{..} | Expr::MatchAll{..} | Expr::Consume{..} |
+                Expr::For{..} | Expr::ForIter{..} | Expr::Block(..) |
+                Expr::Read(..) | Expr::Recv(..) |
+                Expr::Member(..) | Expr::Index(..) => {
                 self.from_expr(stmt_s, local_vars)
             },
             Expr::Background(ref expr) => {
                 self.do_background(&*expr, local_vars)
             },
-            Expr::Pipe(ref stages, ref outfile) => {
-                self.do_pipe(stages, outfile, local_vars)
+            Expr::Pipe(ref stages) => {
+                self.do_pipe(stages, local_vars)
             },
             Expr::And(ref lhs, ref rhs) => {
                 self.do_and_or(&*lhs, &*rhs, false, local_vars)
@@ -945,7 +1013,81 @@ impl Interp {
             Expr::Or(ref lhs, ref rhs) => {
                 self.do_and_or(&*lhs, &*rhs, true, local_vars)
             },
-            Expr::Manip(..) => unimplemented!(),
+            Expr::Manip(ref ops, ref expr) => {
+                fn apply(interp: &mut Interp, ops: &[ManOp], expr: &ExprS, local_vars: &mut LocalVars) -> (Val, Control) {
+                    if ops.len() == 0 {
+                        interp.exec_stmt(expr, local_vars)
+                    } else {
+                        match ops[0] {
+                            ManOp::Merge{from, into} => {
+                                eprintln!("Redirect fd {} to fd {}", from, into);
+                                let _guard = if from != into { Some(IOGuard::redir(from, into)) } else { None };
+                                apply(interp, &ops[1..], expr, local_vars)
+                            },
+                            ManOp::Output{fd, ref sink} => {
+                                let (val, con) = interp.from_expr(&**sink, local_vars);
+                                if con.stops_exec() {
+                                    return (val, con)
+                                }
+                                if let Some(fname) = val.get_str() {
+                                    use std::fs::File;
+                                    use std::os::unix::io::IntoRawFd;
+
+                                    let fout = File::create(fname.to_string()).unwrap();
+                                    let fdout = fout.into_raw_fd();
+
+                                    eprintln!("Redirect fd {} into file {:?} at fd {}", fd, fname, fdout);
+                                    let _guard = IOGuard::redir(fd, fdout);
+                                    apply(interp, &ops[1..], expr, local_vars)
+                                } else {
+                                    unimplemented!()
+                                }
+                            },
+                            ManOp::Input{fd, ref source} => {
+                                let (val, con) = interp.from_expr(&**source, local_vars);
+                                if con.stops_exec() {
+                                    return (val, con)
+                                }
+                                if let Some(fname) = val.get_str() {
+                                    use std::fs::File;
+                                    use std::os::unix::io::IntoRawFd;
+
+                                    let fin = File::open(fname.to_string()).unwrap();
+                                    let fdin = fin.into_raw_fd();
+
+                                    eprintln!("Redirect fd {} from file {:?} at fd {}", fd, fname, fdin);
+                                    let _guard = IOGuard::redir(fd, fdin);
+                                    apply(interp, &ops[1..], expr, local_vars)
+                                } else {
+                                    unimplemented!()
+                                }
+                            },
+                            ManOp::Heredoc{expr: ref e} => {
+                                let (val, con) = interp.from_expr(&**e, local_vars);
+                                if con.stops_exec() {
+                                    return (val, con)
+                                }
+                                if let Ok(text) = val.take_str() {
+                                    use std::io::{Write, Seek, SeekFrom};
+                                    use std::os::unix::io::IntoRawFd;
+
+                                    let mut tmpf = ::tempfile::tempfile().unwrap();
+
+                                    tmpf.write_all(text.as_bytes()).unwrap();
+                                    tmpf.seek(SeekFrom::Start(0)).unwrap();
+
+                                    let fdhere = tmpf.into_raw_fd();
+                                    let _guard = IOGuard::redir(0, fdhere);
+                                    apply(interp, &ops[1..], expr, local_vars)
+                                } else {
+                                    unimplemented!()
+                                }
+                            },
+                        }
+                    }
+                }
+                apply(self, &ops[..], expr, local_vars)
+            },
         }
     }
 
@@ -969,17 +1111,9 @@ impl Interp {
         }
     }
 
-    fn do_pipe(&mut self, stages: &Vec<ExprS>, outfile: &Option<Box<ExprS>>, local_vars: &mut LocalVars) -> (Val, Control) {
+    fn do_pipe(&mut self, stages: &Vec<ExprS>, local_vars: &mut LocalVars) -> (Val, Control) {
         let mut pipeline = Pipeline::create(stages);
-        let ret = outfile.as_ref().map(|outfile| {
-            self.from_expr(&**outfile, local_vars)
-        });
-        if let Some((ref val, ref con)) = ret {
-            if con.stops_exec() {
-                return (val.clone(), *con)
-            }
-        }
-        let (val, con) = pipeline.exec(self, ret.and_then(|x| x.0.get_string()), local_vars);
+        let (val, con) = pipeline.exec(self, local_vars);
         (val, con)
     }
 
@@ -1074,5 +1208,30 @@ impl Interp {
         ret.0.unhandled();
         local_vars.exit_scope();
         ret
+    }
+}
+
+pub struct IOGuard {
+    from: i32,
+    old: i32,
+}
+
+impl IOGuard {
+    pub fn redir(from: i32, into: i32) -> Self {
+        use nix::fcntl::{self, fcntl, FcntlArg};
+
+        let old = dup(from).unwrap();
+        fcntl(old, FcntlArg::F_SETFL(fcntl::O_CLOEXEC)).unwrap();
+        close(from).unwrap();
+        dup2(into, from).unwrap();
+        IOGuard{from, old}
+    }
+}
+
+impl Drop for IOGuard {
+    fn drop(&mut self) {
+        close(self.from).unwrap();
+        dup2(self.old, self.from).unwrap();
+        close(self.old).unwrap();
     }
 }

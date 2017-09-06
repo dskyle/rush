@@ -85,6 +85,13 @@ impl Func {
         Func{args: args, body: User(f)}
     }
 
+    pub fn is_user(&self) -> bool {
+        if let FuncBody::User(..) = self.body {
+            return true;
+        }
+        return false;
+    }
+
     /*
     pub fn into_lambda(f: Func) -> Func {
         lazy_static! { static ref LAMBDA_COUNT: usize = 0; }
@@ -334,25 +341,30 @@ impl FuncMap {
         //println!("Registering fn {:?}", b);
         key = FuncKey::from_pat(&b.args);
         if let Some(ref mut v) = self.map.get_mut(&key) {
-            let mut pos = None;
+            enum Action { Replace(usize), Insert(usize), Append };
+            let mut pos = Action::Append;
             for (i, ref o) in v.iter().enumerate() {
                 match b.args.subsumes(&o.args) {
                     ContainedBy => {
-                        pos = Some(i);
+                        pos = Action::Insert(i);
                         break;
                     },
-                    Overlaps | Same => {
+                    Same => {
+                        pos = Action::Replace(i);
+                        break;
+                    },
+                    Overlaps => {
                         return false;
                     },
                     _ => {},
                 }
             }
             //println!("Registering fn overload {:?}", pat);
-            if let Some(pos) = pos {
-                v.insert(pos, b);
-            } else {
-                v.push(b);
-            }
+            match pos {
+                Action::Replace(pos) => if v[pos].is_user() {  v[pos] = b } else { return false },
+                Action::Insert(pos) => v.insert(pos, b),
+                Action::Append => v.push(b),
+            };
             return true;
             //println!("Registering fn {:?}", pat);
             //println!("  Overload set: {:?}", v);

@@ -135,7 +135,7 @@ pub fn eval(i: &mut Interp, locs: &mut LocalVars, args: Val) -> Val
 
 pub fn mkval_str(i: &mut Interp, locs: &mut LocalVars, cmd: &str) -> Val
 {
-    let mut lex = ::rush_parser::lex::ContextLexer::new();
+    let mut lex = ::rush_parser::val_lex::ValueLexer::new();
     let parsed = ::rush_parser::parse::parse(lex.lex(cmd));
     match parsed {
         Ok(ref e) if e.len() == 1 && e[0].0.is_value() => i.from_expr(&e[0], locs).0,

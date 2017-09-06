@@ -36,7 +36,7 @@ impl<'a> Pipeline<'a> {
         Pipeline{ stages: stages.into_iter().map(|x| Stage::create(x)).collect() }
     }
 
-    pub fn exec<S: ToString>(&mut self, interp: &mut Interp, outfile: Option<S>, local_vars: &mut LocalVars) -> (Val, Control) {
+    pub fn exec(&mut self, interp: &mut Interp, local_vars: &mut LocalVars) -> (Val, Control) {
         let mut use_input = 0;
         let n = self.stages.len();
         if n == 0 {
@@ -81,29 +81,15 @@ impl<'a> Pipeline<'a> {
             }
         }
         let (val, con) = {
+            use nix::fcntl::{self, fcntl, FcntlArg};
             let last_stage = self.stages.last_mut().unwrap();
 
             let oldin = if use_input != 0 {
                 let oldin = dup(0).unwrap();
+                fcntl(oldin, FcntlArg::F_SETFL(fcntl::O_CLOEXEC)).unwrap();
                 dup2(use_input, 0).unwrap();
                 close(use_input).unwrap();
                 Some(oldin)
-            } else {
-                None
-            };
-
-            let oldout = if let Some(outfile) = outfile {
-                let oldout = dup(1).unwrap();
-
-                use std::fs::File;
-                use std::os::unix::io::IntoRawFd;
-
-                let fout = File::create(outfile.to_string()).unwrap();
-                let fd = fout.into_raw_fd();
-
-                dup2(fd, 1).unwrap();
-                close(fd).unwrap();
-                Some(oldout)
             } else {
                 None
             };
@@ -114,11 +100,6 @@ impl<'a> Pipeline<'a> {
             if let Some(oldin) = oldin {
                 dup2(oldin, 0).unwrap();
                 close(oldin).unwrap();
-            }
-
-            if let Some(oldout) = oldout {
-                dup2(oldout, 1).unwrap();
-                close(oldout).unwrap();
             }
 
             ret

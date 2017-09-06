@@ -48,6 +48,36 @@ impl Pat {
             _ => false,
         }
     }
+
+    pub fn has_wild(&self) -> bool {
+        match *self {
+            Pat::Wild(_) => true,
+            Pat::Tup(ref v) => {
+                if let Some(&Pat::Wild(_)) = v.last() { true } else { false }
+            },
+            Pat::Bind(_, ref p) => p.has_wild(),
+            _ => false,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match *self {
+            Pat::Tup(ref v) => v.len(),
+            Pat::Bind(_, ref p) => p.len(),
+            _ => 1,
+        }
+    }
+
+    pub fn req_len(&self) -> usize {
+        match *self {
+            Pat::Tup(ref v) => {
+                v.len() - if self.has_wild() { 1 } else { 0 }
+            },
+            Pat::Bind(_, ref p) => p.req_len(),
+            Pat::Wild(..) => 0,
+            _ => 1,
+        }
+    }
 }
 
 impl PartialEq for RegexEq {

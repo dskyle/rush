@@ -336,13 +336,15 @@ impl Subsumes<Val> for Pat {
             (&ID(_), _) => Contains,
             (_, &Val::Ref(ref var)) => var.with_ref(|x| self.subsumes(x)),
             (_, &Val::Embed(ref val)) => self.subsumes(&**val),
-            (&Tup(ref pt), &Val::Tup(ref vt)) => {
+            (&Tup(_), &Val::Tup(ref vt)) => {
+                self.subsumes(&ValArray(vt))
+                /*
                 let piter = pt.iter();
                 let viter = vt.iter();
                 let (mut pi, ret) = process_tup_check(self, piter, viter, 0);
                 let done = pi.next().is_none();
                 //println!("Returning for {:?} ?= {:?}  ===>  {:?} {:?}", self, val, ret, done);
-                if ret && done { Contains } else { Disjoint }
+                if ret && done { Contains } else { Disjoint }*/
             },
             (&Tup(ref pt), &Val::Error(ref e)) => {
                 if pt.len() >= 1 && pt[0].get_atom() == Some(ERR_NAME) {
@@ -370,6 +372,28 @@ impl Subsumes<Val> for Pat {
             (&StrList(_), _) => Disjoint,
             //(&Tup(ref pt), _) if pt.len() == 1 || (pt.len() > 1 && pt[1].is_wild()) => pt[0].subsumes(val),
             (&Tup(_), _) => Disjoint,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ValArray<'a>(pub &'a[Val]);
+
+impl<'a> Subsumes<ValArray<'a>> for Pat {
+    fn subsumes(&self, vt: &ValArray<'a>) -> Subsumption {
+        use self::Pat::*;
+        use self::Subsumption::*;
+
+        //println!("Checking {:?} {:?}", self, vt);
+        if let Tup(ref pt) = *self {
+            let piter = pt.iter();
+            let viter = vt.0.iter();
+            let (mut pi, ret) = process_tup_check(self, piter, viter, 0);
+            let done = pi.next().is_none();
+            //println!("Returning for {:?} ?= {:?}  ===>  {:?} {:?}", self, vt, ret, done);
+            if ret && done { Contains } else { Disjoint }
+        } else {
+            Disjoint
         }
     }
 }

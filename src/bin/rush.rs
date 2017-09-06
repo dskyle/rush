@@ -6,7 +6,7 @@ extern crate hostname;
 extern crate users;
 extern crate ansi_term;
 
-use rush::{util, Val, Processor, PartialLex, Tok, Span};
+use rush::{util, Val, Processor, PartialLex};
 
 fn make_prompt(color: bool, esc: bool) -> String {
     use users::{get_user_by_uid, get_current_uid};
@@ -56,7 +56,7 @@ fn do_interactive_command(processor: &mut Processor, line: &str, partial: Option
             let ret = panic::catch_unwind(AssertUnwindSafe(|| { processor.exec_partial(&line, tmp) }));
             match ret {
                 Ok(Ok(x)) => { *partial = None; Ok(x)},
-                Ok(Err(mut p)) => {
+                Ok(Err(p)) => {
                     *partial = Some(p);
                     return true
                 },
