@@ -9,7 +9,7 @@ description = "lexer/parser for rush shell"
 regex = "0.2.1"
 lazy_static = "0.2.2"
 odds = "0.2.25"
-plex = { git = "https://github.com/goffrie/plex" }
+plex = { path = "../../plex" }
 
 [dependencies.rush_pat]
 path = "../rush_pat"

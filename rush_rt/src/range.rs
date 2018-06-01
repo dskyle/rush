@@ -241,12 +241,12 @@ impl RangeExt for Range {
 
         match *self {
             Range::WithinInt(from, to) => {
-                return Ok(Tup((from ... to).map(|i| Str(i.to_string())).collect()));
+                return Ok(Tup((from ..= to).map(|i| Str(i.to_string())).collect()));
             },
             Range::WithinAscii(from, to) => {
                 let from = from as i16;
                 let to = to as i16;
-                return Ok(Tup((from ... to).map(|i| Str((i as u8 as char).to_string())).collect()));
+                return Ok(Tup((from ..= to).map(|i| Str((i as u8 as char).to_string())).collect()));
             },
             Range::WithinStr(..) => {
                 return Err(InvalidRange(self.clone(), "Attempted to enumerate string range (only integer or char ranges allowed)"));

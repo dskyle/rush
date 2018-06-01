@@ -26,7 +26,7 @@ pub enum Tok {
     Gt,
     Assign,
     Into,
-    Member(String),
+    Member(String, bool),
     AssignIfNull,
     Suffix,
     Prefix,
@@ -39,6 +39,7 @@ pub enum Tok {
     If,
     Else,
     While,
+    Loop,
     For,
     In,
     Using,
@@ -139,6 +140,7 @@ lexer! {
     r##"if"## => Tok::If,
     r##"else"## => Tok::Else,
     r##"while"## => Tok::While,
+    r##"loop"## => Tok::Loop,
     r##"for"## => Tok::For,
     r##"in"## => Tok::In,
     r##"using"## => Tok::Using,
@@ -152,7 +154,8 @@ lexer! {
 
     r##"="## => Tok::Assign,
     r##"=>"## => Tok::Into,
-    r##"\$\.(|,|-|,-|-,)"## => Tok::Member(text.into()),
+    r##"\$\.(|,|-|,-|-,)"## => Tok::Member(text.into(), false),
+    r##"\|>(|,|-|,-|-,)"## => Tok::Member(text.into(), true),
     r##"\?="## => Tok::AssignIfNull,
     r##"\+="## => Tok::Suffix,
     r##"^="## => Tok::Prefix,
@@ -591,7 +594,7 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
 
             Tok::For | Tok::Func | Tok::Match | Tok::MatchAll | Tok::Consume |
                 Tok::Comma | Tok::Break | Tok::Continue | Tok::Return |
-                Tok::Gt | Tok::Lt |
+                Tok::Gt | Tok::Lt | Tok::Loop |
                 Tok::Var(_) | Tok::VarIdent(_) | Tok::Exec(_) | Tok::Redir(_, _) |
                 Tok::Ident(_) | Tok::NakedString(_) | Tok::Range |
                 Tok::SingleString(_) | Tok::DoubleString(..) |
@@ -610,6 +613,7 @@ impl<'a, 'b> Iterator for ContextLexerIterator<'a, 'b> {
                 Tok::If => Tok::Ident("if".into()),
                 Tok::For => Tok::Ident("for".into()),
                 Tok::While => Tok::Ident("while".into()),
+                Tok::Loop => Tok::Ident("loop".into()),
                 Tok::Let => if kw == Let { tok } else { Tok::Ident("let".into()) },
                 Tok::Read => if kw == Let { tok } else { Tok::Ident("read".into()) },
                 Tok::Recv => if kw == Let { tok } else { Tok::Ident("recv".into()) },

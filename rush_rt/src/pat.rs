@@ -10,7 +10,7 @@ use rush_pat::subsume::{Subsumption, Subsumes};
 use rush_parser::lex::is_identifier;
 use regex::Regex;
 use std::convert::TryFrom;
-use std::iter::IntoIterator;
+use std::iter::{once, IntoIterator};
 
 pub static ERR_NAME : &str = "Err!";
 
@@ -236,11 +236,11 @@ fn do_match_impl(this: &Pat, val: Cow<Val>, b: &mut LocalVars, wrap_some: bool) 
     use self::Pat::*;
 
     //println!("Binding {:?} from {:?}", this, val);
-    match this {
-        &ID(ref s) | &Bind(ref s, _) => {
+    match *this {
+        ID(ref s) | Bind(ref s, _) => {
             do_binding(s.as_ref(), val, b, wrap_some);
         },
-        &Tup(ref pt) => match val {
+        Tup(ref pt) => match val {
                 Borrowed(&Val::Tup(ref vt)) => {
                     let piter = pt.iter();
                     let viter = vt.iter().map(Cow::from);
@@ -255,10 +255,10 @@ fn do_match_impl(this: &Pat, val: Cow<Val>, b: &mut LocalVars, wrap_some: bool) 
                 },
                 Borrowed(&Val::Error(ref e)) => if pt.len() > 1 && pt[0].get_atom() == Some(ERR_NAME) {
                     e.1.set(true);
-                    let vt = &e.0;
+                    let val = &*e.0;
                     let mut piter = pt.iter();
                     piter.next();
-                    let viter = vt.iter().map(Cow::from);
+                    let viter = once(val).map(Cow::from);
                     //println!("Calling process_tup_matches (Tup)");
                     process_tup_matches(this, piter, viter, b, wrap_some);
                 },
@@ -267,13 +267,13 @@ fn do_match_impl(this: &Pat, val: Cow<Val>, b: &mut LocalVars, wrap_some: bool) 
                     piter.next();
                     match Rc::try_unwrap(e) {
                         Ok(e) => {
-                            let viter = e.0.into_iter().map(Cow::from);
+                            let viter = once(&*e.0).map(Cow::from);
                             //println!("Calling process_tup_matches (Tup)");
                             process_tup_matches(this, piter, viter, b, wrap_some);
                         },
                         Err(e) => {
                             e.1.set(true);
-                            let viter = e.0.iter().map(Cow::from);
+                            let viter = once(&*e.0).map(Cow::from);
                             //println!("Calling process_tup_matches (Tup)");
                             process_tup_matches(this, piter, viter, b, wrap_some);
                         }
@@ -289,7 +289,7 @@ fn do_match_impl(this: &Pat, val: Cow<Val>, b: &mut LocalVars, wrap_some: bool) 
                 },
                 _ => {}
             },
-        &Rex(RegexEq(ref r)) => {
+        Rex(RegexEq(ref r)) => {
             //println!("regex do for {:?}", val);
             if let Some(s) = val.get_string() {
                 //println!("regex for {:?}", s);
@@ -316,7 +316,7 @@ fn do_match_impl(this: &Pat, val: Cow<Val>, b: &mut LocalVars, wrap_some: bool) 
                 }
             }
         }
-        &Wild(ref vec) => {
+        Wild(ref vec) => {
             search_wild_matches(vec, val, b);
         }
         _ => {}

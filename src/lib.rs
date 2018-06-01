@@ -5,6 +5,9 @@
 #![feature(splice)]
 #![feature(const_fn)]
 #![feature(integer_atomics)]
+#![feature(const_ptr_null_mut)]
+#![feature(const_atomic_ptr_new)]
+#![feature(const_atomic_i32_new)]
 
 //extern crate regex;
 

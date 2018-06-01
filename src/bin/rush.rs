@@ -67,14 +67,7 @@ fn do_interactive_command(processor: &mut Processor, line: &str, partial: Option
     };
     match ret {
         Ok((ret, con)) => {
-            match ret {
-                Val::Error(_) => {
-                    println!("Error: {}", ret);
-                },
-                _ => {
-                    println!(" => {}", ret.repr());
-                },
-            }
+            println!(" => {}", ret.repr());
             if con.stops_exec() {
                 return false;
             }

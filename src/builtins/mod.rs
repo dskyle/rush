@@ -89,7 +89,7 @@ pub fn index(_: &mut Interp, locs: &mut LocalVars) -> Val
             }) {
                 return e;
             }
-            return ret.unwrap();
+            return ret.unwrap_or_else(|| Val::void());
         }
         Err(err) => return err,
     }

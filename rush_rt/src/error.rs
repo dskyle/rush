@@ -16,7 +16,7 @@ pub enum RuntimeError {
     InvalidIdentifier(String),
     InvalidIter(Box<Val>),
     InvalidNext(Box<Val>),
-    CustomError(Vec<Val>),
+    CustomError(Box<Val>),
 }
 
 pub type Res<T> = Result<T, RuntimeError>;

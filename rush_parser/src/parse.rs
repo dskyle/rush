@@ -80,12 +80,12 @@ parser! {
         stmt2[s] ws => s,
         let_rule[i] => i,
         func[f] => f,
-        control_flow[c] => c,
         => Ok(ExprS(Expr::Nop, Span::new(Pos::new(1,1), Pos::new(1,1)))),
     }
 
     stmt2: Res<ExprS> {
         set_rule[i] => i,
+        control_flow[c] => c,
         stmt3[s] ws => s,
         stmt3[s] ws Amp => Ok(ExprS(Expr::Background(Box::new(s?)), span!())),
     }
@@ -132,20 +132,16 @@ parser! {
 
     subexpr: Res<ExprS> {
         //expr3[e] => e,
-        ws_tuple_val[tup] => tup,
         comma_tuple_val[tup] => tup,
     }
 
-    /*expr3: Res<ExprS> {
-        if_rule[i] => i,
-        while_rule[w] => w,
-        for_rule[f] => f,
-        match_rule[m] => m,
-    }*/
+    ws_expr: Res<ExprS> {
+        ws_tuple_val[tup] => tup,
+    }
 
     ws_tuple_val: Res<ExprS> {
         #[no_reduce(Range, Ident, Hereval, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen, ExecLSquare,
-                    Read, Recv, If, While, For, Match, MatchAll, Consume, LambdaOpen)]
+                    Read, Recv, If, Loop, While, For, Match, MatchAll, Consume, LambdaOpen)]
         ws_tuple[tup] => {
             let mut tup = tup?;
             if tup.len() == 1 {
@@ -157,8 +153,14 @@ parser! {
     }
 
     comma_tuple_val: Res<ExprS> {
-        comma_tuple[tup] =>
-            Ok(ExprS(Expr::Tuple(TupleStyle::Comma, tup?), span!())),
+        comma_tuple[tup] => {
+            let (force_list, mut tup) = tup?;
+            if tup.len() == 1 && !force_list {
+                Ok(tup.pop().unwrap())
+            } else {
+                Ok(ExprS(Expr::Tuple(TupleStyle::Comma, tup), span!()))
+            }
+        },
     }
 
     parens: Res<ExprS> {
@@ -170,13 +172,14 @@ parser! {
     member: Res<ExprS> {
         #[no_reduce(LSquare)]
         indexing[i] ws => i,
-        member[l] ws Member(m) ws var_ref_inline[r] ws => make_member(l?, m, r?, span!()),
-        member[l] ws Member(m) ws parens[r] ws => make_member(l?, m, r?, span!()),
+        member[l] ws Member(m, p) ws var_ref_inline[r] ws => make_member(l?, m, r?, p, span!()),
+        member[l] ws Member(m, p) ws parens[r] ws => make_member(l?, m, r?, p, span!()),
     }
 
     subexpr2: Res<ExprS> {
         if_rule[i] => i,
         while_rule[w] => w,
+        loop_rule[w] => w,
         for_rule[f] => f,
         read_rule[r] => r,
         recv_rule[r] => r,
@@ -302,7 +305,7 @@ parser! {
     }
 
     ws_tuple: Res<Vec<ExprS>> {
-        #[no_reduce(Comma, LSquare, Member)]
+        #[no_reduce(LSquare, Member)]
         member[a] ws => Ok(vec![a?]),
 
         #[no_reduce(LSquare, Member)]
@@ -311,16 +314,17 @@ parser! {
         },
     }
 
-    comma_tuple: Res<Vec<ExprS>> {
+    comma_tuple: Res<(bool, Vec<ExprS>)> {
+        #[no_reduce(Comma, Range, Ident, Hereval, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen,
+                    ExecLSquare, Read, Recv, If, Loop, While, For, Match, MatchAll, Consume, LambdaOpen)]
+        ws_expr[a] ws => Ok((false, vec![a?])),
+
         #[no_reduce(Range, Ident, Hereval, NakedString, DoubleString, SingleString, Rex, Var, LParen, VarLBrace, ExecLParen,
-                    ExecLSquare, Read, Recv, If, While, For, Match, MatchAll, Consume, LambdaOpen)]
-        member[a] ws Comma ws => Ok(vec![a?]),
+                    ExecLSquare, Read, Recv, If, Loop, While, For, Match, MatchAll, Consume, LambdaOpen)]
+        ws_expr[a] ws Comma ws => Ok((true, vec![a?])),
 
-        #[no_reduce(Comma, LSquare, Member)]
-        member[a] ws Comma ws member[b] ws => Ok(vec![a?, b?]),
-
-        member[a] ws Comma ws comma_tuple[tup] => {
-            let tup = tup?; let mut v = vec![a?]; v.extend(tup); Ok(v)
+        ws_expr[a] ws Comma ws comma_tuple[tup] => {
+            let (_, tup) = tup?; let mut v = vec![a?]; v.extend(tup); Ok((true, v))
         },
     }
 
@@ -378,9 +382,9 @@ parser! {
                 match n.0 {
                     Expr::Ident(_) | Expr::Var(..) => Ok(ExprS::var(m, n, span)),
                     //Expr::String(_) | Expr::XString(_) =>
-                    Expr::Member(_, val, call) => {
+                    Expr::Member(_, val, call, p) => {
                         let new_val: ExprS = fixup(SubsMode::new(), *val, span)?;
-                        Ok(ExprS(Expr::Member(m, Box::new(new_val), call), span))
+                        Ok(ExprS(Expr::Member(m, Box::new(new_val), call, p), span))
                     },
                     Expr::Index(_, val, idx) => {
                         let new_val: ExprS = fixup(SubsMode::new(), *val, span)?;
@@ -440,7 +444,7 @@ parser! {
 
     capture: Res<Vec<(String, Option<ExprS>)>> {
         LSquare nl comma_tuple[c] nl RSquare => {
-            let c = c?;
+            let (_, c) = c?;
             let mut ret = Vec::with_capacity(c.len());
             for x in c.into_iter() {
                 match x {
@@ -522,6 +526,12 @@ parser! {
         },
     }
 
+    loop_rule: Res<ExprS> {
+        Loop nl block[lo] ws => {
+            Ok(ExprS(Expr::Loop{lo: lo?}, span!()))
+        },
+    }
+
     for_rule: Res<ExprS> {
         For ws expr[bind] nl In nl subexpr[iter] nl block[lo] ws => {
             let pat = ExprS::to_pat(bind?)?;
@@ -543,9 +553,14 @@ parser! {
         },
     }
 
+    indexing_expr: Res<ExprS> {
+        expr[e] nl => e,
+        nl => Ok(ExprS(Expr::Tuple(TupleStyle::Spaced, vec![]), Span::zero())),
+    }
+
     indexing: Res<ExprS> {
         subexpr2[n] ws => n,
-        indexing[n] ws LSquare nl expr[i] nl RSquare ws => {
+        indexing[n] ws LSquare nl indexing_expr[i] nl RSquare ws => {
             let mut n = n?;
             let m = n.0.take_subs_mode().unwrap_or(SubsMode::new());
             Ok(ExprS(Expr::Index(m, Box::new(n), Box::new(i?)), span!()))
@@ -662,22 +677,15 @@ parser! {
     }
 
     match_one: Res<(Pat, ExprS)> {
-        expr[e] ws Into ws block_expr[b] ws match_sep ws => {
+        expr[e] nl Into nl stmt[b] ws match_sep nl => {
             Ok((ExprS::to_pat(e?)?, b?))
-        }
-
-        expr[e] ws Into ws ws_tuple_val[t] ws Comma ws => {
-            Ok((ExprS::to_pat(e?)?, t?))
-        }
-
-        expr[e] ws Into ws control_flow[t] ws Comma ws => {
-            Ok((ExprS::to_pat(e?)?, t?))
         }
     }
 
     match_sep: () {
-        Comma nl => (),
-        => (),
+        //#[no_reduce(Semi, Comma)]
+        stmt_sep => (),
+        Comma ws => (),
     }
 
     match_list: Res<Vec<(Pat, ExprS)>> {
@@ -964,6 +972,6 @@ fn process_hereobj(here: HereRef, span: Span) -> Box<ExprS> {
     }
 }
 
-fn make_member(l: ExprS, m: String, r: ExprS, span: Span) -> Res<ExprS> {
-    Ok(ExprS(Expr::Member(parse_subs_mode(&m[2..], l.1)?, Box::new(l), Box::new(r)), span))
+fn make_member(l: ExprS, m: String, r: ExprS, is_pipe: bool, span: Span) -> Res<ExprS> {
+    Ok(ExprS(Expr::Member(parse_subs_mode(&m[2..], l.1)?, Box::new(l), Box::new(r), is_pipe), span))
 }

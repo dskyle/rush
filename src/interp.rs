@@ -1,4 +1,4 @@
-use rush_parser::ast::{ExprS, Expr, SetOp, ImportScope, SubsMode, Span, ManOp};
+use rush_parser::ast::{ExprS, Expr, SetOp, ImportScope, SubsMode, Span, Pos, ManOp, TupleStyle};
 use rush_pat::pat::Pat;
 use rush_rt::vars::{VarRef, LocalVars, Resolver, Binder, Scoped};
 use rush_rt::val::{Val, InternalIterable};
@@ -69,24 +69,32 @@ impl Interp {
         let c = self.try_call(t, span, l);
         return match c {
             Ok(val) => val,
-            Err(val) => val.take_tup().unwrap().into_iter().nth(1).unwrap(),
+            Err(val) => {
+                let val = val.take_tup().unwrap().into_iter().nth(1).unwrap();
+                if let Some(val) = val.get_err_val() {
+                    self.call_op_bool(val, span, l)
+                } else {
+                    val
+                }
+            }
         };
     }
 
     fn if_cond(&mut self, r: &mut LocalVars, cond: &ExprS, has_else: bool) -> Result<bool, (Val, Control)> {
         match *cond {
             ExprS(Expr::Let(ref b, ref e), _span) => {
-                let mut val = self.from_expr(&*e, r);
-                if val.1.stops_exec() {
-                    return Err(val);
+                let (mut val, con) = self.from_expr(&*e, r);
+                if con.stops_exec() {
+                    return Err((val, con));
                 }
-                val.0.eval();
+                val.eval();
                 r.enter_scope();
-                if b.subsumes(&val.0).same_or_contains() {
-                    b.do_match_unchecked(val.0.into(), r);
+                if b.subsumes(&val).same_or_contains() {
+                    b.do_match_unchecked(val.into(), r);
                     return Ok(true);
                 } else {
                     r.exit_scope();
+                    if val.is_err() { return Err((val, con)) }
                     if has_else { r.enter_scope(); }
                     return Ok(false);
                 }
@@ -94,12 +102,15 @@ impl Interp {
             ExprS(Expr::Recv(ref p), _span) => {
                 r.enter_scope();
                 let (val, con) = self.do_recv(p, r, true);
+                if con.stops_exec() {
+                    return Err((val, con));
+                }
                 if val.is_true() {
                     return Ok(true);
                 } else {
                     r.exit_scope();
                     if has_else { r.enter_scope(); }
-                    return Err((val, con));
+                    return Ok(false);
                 }
             },
             ref e => {
@@ -119,7 +130,11 @@ impl Interp {
                         return Ok(false);
                     },
                     None => {
-                        panic!("If condition not boolean (1 or 0) [{:?}]", val);
+                        if val.is_err() {
+                            return Err((val, con))
+                        } else {
+                            return Err((Val::err_string(format!("If condition not boolean (1 or 0) [{:?}]", val)), con));
+                        }
                     },
                 }
             },
@@ -156,7 +171,7 @@ impl Interp {
                     if b {
                         res = self.exec_stmt_list(lo, r);
                         r.exit_scope();
-                        if res.1.breaks_loops() {
+                        if res.1.breaks_loops() || res.0.is_err() {
                             res.1.clear_breaks();
                             break
                         }
@@ -166,6 +181,19 @@ impl Interp {
             }
         }
         res
+    }
+
+    fn do_loop(&mut self, r: &mut LocalVars, lo: &Vec<ExprS>) -> (Val, Control) {
+        //println!("{:?}", e);
+        loop {
+            r.enter_scope();
+            let mut res = self.exec_stmt_list(lo, r);
+            r.exit_scope();
+            if res.1.breaks_loops() || res.0.is_err() {
+                res.1.clear_breaks();
+                return res;
+            }
+        }
     }
 
     fn do_lambda(&mut self, r: &mut LocalVars,
@@ -442,24 +470,38 @@ impl Interp {
 
         //println!("from_expr: {:?}", e);
         match e.0 {
-            Tuple(_, ref v) => {
+            Tuple(style, ref v) => {
                 let mut is_new_err = false;
-                let mut ret = vec![];
+                let mut ret = Vec::with_capacity(v.len());
                 for x in v.iter().enumerate() {
-                    match self.from_expr(x.1, r) {
-                        (e @ Val::Error(..), c) => return (e, c),
-                        (v, Control::Done) => {
-                            if x.0 == 0 && v.get_str().unwrap_or("") == "Err!" {
-                                is_new_err = true
-                            } else {
-                                ret.push(v)
-                            }
-                        },
-                        (v, c) => return (v, c),
+                    let (val, con) = self.from_expr(x.1, r);
+                    if con.stops_exec() || val.is_err() {
+                        return (val, con);
+                    }
+                    if x.0 == 0 && style == TupleStyle::Named &&
+                            val.get_str().unwrap_or("") == "Err!" {
+                        is_new_err = true
+                    } else {
+                        ret.push(val)
                     }
                 }
                 if is_new_err {
-                    (Val::custom_err(ret, Some(e.1)), Control::Done)
+                    if ret.len() == 2 {
+                        let span = if let Some(t) = ret[1].get_tup() {
+                            if t.len() == 2 {
+                                if let (Some(l), Some(c)) = (t[0].get_usize(), t[1].get_usize()) {
+                                    let pos = Pos::new(l, c);
+                                    let span = Span::new(pos, pos);
+                                    Some(span)
+                                } else{ None }
+                            } else{ None }
+                        } else{ None };
+                        if let Some(span) = span {
+                            return (Val::custom_err(ret.into_iter().next().unwrap(), Some(span)), Control::Done)
+                        }
+                    }
+                    (Val::custom_err(if ret.len() == 1 { ret.into_iter().next().unwrap() } else
+                                     { Tup(ret) }, Some(e.1)), Control::Done)
                 } else {
                     (Tup(ret), Control::Done)
                 }
@@ -528,6 +570,7 @@ impl Interp {
             }
             If{ref cond, ref then, ref el} => self.do_if(r, cond, then, el),
             While{ref cond, ref lo} => self.do_while(r, cond, lo),
+            Loop{ref lo} => self.do_loop(r, lo),
             Match{ref val, ref cases} => self.do_match(r, val, cases),
             MatchAll{ref val, ref cases} => self.do_match_all(r, val, cases),
             Consume{ref val, ref cases} => self.do_consume(r, val, cases),
@@ -535,7 +578,7 @@ impl Interp {
             ForIter{ref pat, ref iter, ref lo} => self.do_for_iter(r, pat, iter, lo),
             Read(ref ids) => self.do_read(ids, r),
             Recv(ref pat) => self.do_recv(pat, r, false),
-            Member(m, ref lhs, ref rhs) => {
+            Member(m, ref lhs, ref rhs, is_pipe) => {
                 let (lval, con) = self.from_expr(&**lhs, r);
                 if con.stops_exec() {
                     return (lval, con);
@@ -550,7 +593,11 @@ impl Interp {
                 rval.eval();
                 let to_call = match rval {
                     e @ Val::Error(..) => return (e, Control::Done),
-                    Val::Str(s) => vec![Val::Str("op::get_prop".into()), lval, Val::Str(s)],
+                    Val::Str(s) => if is_pipe {
+                            vec![Val::Str(s), lval]
+                        } else {
+                            vec![Val::Str("op::get_prop".into()), lval, Val::Str(s)]
+                        },
                     Val::Tup(mut v) => { v.insert(1, lval); v },
                     _ => unreachable!(),
                 };
@@ -562,17 +609,12 @@ impl Interp {
                 if con.stops_exec() {
                     return (val, con);
                 }
-                if val.is_err() {
-                    return (val, Control::Done);
-                }
                 let (mut index, con) = self.from_expr(&**index, r);
-                if con.stops_exec() {
+                if con.stops_exec() || index.is_err() {
                     return (index, con);
                 }
                 index.eval();
-                if index.is_err() {
-                    return (index, Control::Done)
-                }
+                let val = val.decay_err();
                 let to_call = vec![Val::Str("op::index".into()), val, index];
                 let val = self.call(Val::Tup(to_call), e.1, r);
                 (val.subst(m), Control::Done)
@@ -727,7 +769,12 @@ impl Interp {
         fn imp(this: &mut Interp, n: &ExprS, l: &mut LocalVars, f: &mut FnMut(&mut Interp, &mut Val)) -> Result<(), Val> {
             fn do_id(this: &mut Interp, id: &str, l: &mut LocalVars, f: &mut FnMut(&mut Interp, &mut Val)) -> Result<(), Val> {
                 if let Some(var) = l.get(id) {
-                    var.with_mut(|x| f(this, x));
+                    var.with_mut(|x| {
+                        if x.is_err() {
+                            *x = ::std::mem::replace(x, Val::void()).decay_err();
+                        }
+                        f(this, x)
+                    });
                     return Ok(());
                 }
                 let var = l.bind(id.clone(), Val::void());
@@ -786,9 +833,12 @@ impl Interp {
         }
 
         match n.0 {
-            Expr::Member(_, ref lhs, ref rhs) => {
+            Expr::Member(_, ref lhs, ref rhs, is_pipe) => {
                 if op != SetOp::Assign {
                     return Val::err_str("Must use ordinary assignment when setting properties")
+                }
+                if is_pipe {
+                    return Val::err_str("Cannot use value-pipe notation on left side of assignment")
                 }
                 let (mut rval, con) = self.from_expr(&**rhs, local_vars);
                 if con.stops_exec() {
@@ -897,7 +947,7 @@ impl Interp {
                     return val;
                 }
                 val.0.eval();
-                //println!("Bind {:?} to {:?}", bind, val);
+                println!("Bind {:?} to {:?}", bind, val);
                 bind.do_match_unchecked(val.0.into(), local_vars);
                 (Val::void(), Control::Done)
             },
@@ -983,10 +1033,10 @@ impl Interp {
             },
             Expr::Tuple(..) | Expr::Ident(..) | Expr::String(..) | Expr::XString(..) | Expr::Range(..) |
                 Expr::LString(..) | Expr::Exec(..) | Expr::ExecList(..) | Expr::Call(..) | Expr::Var(..) | Expr::Lambda(..) |
-                Expr::Rex(..) | Expr::Hereval{..} => {
+                Expr::Rex(..) | Expr::Hereval{..} | Expr::Index(..) => {
                 let (val, con) = self.from_expr(stmt_s, local_vars);
                 //println!("Will call {:?} => {:?}", stmt, val);
-                if con.stops_exec() {
+                if con.stops_exec() || val.is_err() {
                     (val, con)
                 } else {
                     let val = self.call(val, span, local_vars);
@@ -994,11 +1044,11 @@ impl Interp {
                 }
             },
             Expr::Nop => { (Val::void(), Control::Done) },
-            Expr::If{..} | Expr::While{..} |
+            Expr::If{..} | Expr::While{..} | Expr::Loop{..} |
                 Expr::Match{..} | Expr::MatchAll{..} | Expr::Consume{..} |
                 Expr::For{..} | Expr::ForIter{..} | Expr::Block(..) |
                 Expr::Read(..) | Expr::Recv(..) |
-                Expr::Member(..) | Expr::Index(..) => {
+                Expr::Member(..) => {
                 self.from_expr(stmt_s, local_vars)
             },
             Expr::Background(ref expr) => {
@@ -1026,7 +1076,7 @@ impl Interp {
                             },
                             ManOp::Output{fd, ref sink} => {
                                 let (val, con) = interp.from_expr(&**sink, local_vars);
-                                if con.stops_exec() {
+                                if con.stops_exec() || val.is_err() {
                                     return (val, con)
                                 }
                                 if let Some(fname) = val.get_str() {
@@ -1045,7 +1095,7 @@ impl Interp {
                             },
                             ManOp::Input{fd, ref source} => {
                                 let (val, con) = interp.from_expr(&**source, local_vars);
-                                if con.stops_exec() {
+                                if con.stops_exec() || val.is_err() {
                                     return (val, con)
                                 }
                                 if let Some(fname) = val.get_str() {
@@ -1064,7 +1114,7 @@ impl Interp {
                             },
                             ManOp::Heredoc{expr: ref e} => {
                                 let (val, con) = interp.from_expr(&**e, local_vars);
-                                if con.stops_exec() {
+                                if con.stops_exec() || val.is_err() {
                                     return (val, con)
                                 }
                                 if let Ok(text) = val.take_str() {
@@ -1185,18 +1235,14 @@ impl Interp {
     }
 
     pub fn exec_stmt_list(&mut self, stmt_list: &Vec<ExprS>, local_vars: &mut LocalVars) -> (Val, Control) {
-        use self::Control::*;
-
         let mut ret = Val::void();
         for ref stmt in stmt_list {
             ret.unhandled();
             let (v, c) = self.exec_stmt(stmt, local_vars);
-            match c {
-                Return | Break | Continue | Exit => return (v, c),
-                Done => {
-                    ret = v
-                }
+            if c.stops_exec() || v.is_err() {
+                return (v, c)
             }
+            ret = v
         }
         return (ret, Control::Done)
     }

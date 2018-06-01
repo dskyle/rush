@@ -6,7 +6,6 @@ use std::convert::From;
 use std::borrow::Cow;
 use std::borrow::Cow::*;
 use error::{RuntimeError};
-use std::io::Write;
 use std::rc::Rc;
 use regex::Regex;
 use rush_pat::range::Range;
@@ -19,7 +18,7 @@ pub enum Val {
     Str(String),
     Ref(VarRef),
     Embed(Box<Val>),
-    Error(Rc<(Vec<Val>, Cell<bool>, Vec<Span>)>),
+    Error(Rc<(Box<Val>, Cell<bool>, Vec<Span>)>),
 }
 
 pub trait IntoVal {
@@ -246,11 +245,12 @@ pub enum Indexing<'a> {
     Offset(i64),
     Dict(&'a str),
     Range(Range),
+    Multiple(Vec<Indexing<'a>>),
 }
 
 impl<'a> Indexing<'a> {
     pub fn from_val(val: &'a Val) -> Result<Indexing, Val> {
-        if let Some(i) = val.get_str() {
+        if let Some(i) = val.get_scalar_str() {
             if let Ok(i) = str::parse::<i64>(i) {
                 Ok(Indexing::Offset(i))
             } else {
@@ -258,9 +258,18 @@ impl<'a> Indexing<'a> {
             }
         } else if let Ok(rng) = Range::from_val(val) {
             Ok(Indexing::Range(rng))
+        } else if let Some(v) = val.get_tup() {
+            let mut ret = Vec::with_capacity(v.len());
+            for val in v {
+                match Indexing::from_val(val) {
+                    Ok(i) => ret.push(i),
+                    Err(val) => return Err(val),
+                }
+            }
+            Ok(Indexing::Multiple(ret))
         } else {
             Err(Val::err(RuntimeError::InvalidIndex(val.clone().into(),
-                         "Index must be a scalar or range"), None))
+                         "Index must be a scalar, tuple, or range"), None))
         }
     }
 }
@@ -326,7 +335,8 @@ impl Val {
                     return ret;
                 }
                 Error(ref e) => {
-                    return "Err!".to_string() + &Tup(e.0.clone()).repr();
+                    let span = e.2.first().map(|x| *x).unwrap_or(Span::zero());
+                    return format!("Err!({}, ({}, {}))", e.0.repr(), span.l.line, span.l.col);
                 }
                 Embed(ref e) => e.repr(),
                 Ref(..) => unreachable!(),
@@ -364,9 +374,7 @@ impl Val {
                 while i < v.len() {
                     match v[i] {
                         Error(..) => {
-                            let mut tmp = Val::void();
-                            ::std::mem::swap(&mut tmp, &mut v[i]);
-                            new_val = Some(tmp);
+                            new_val = Some(::std::mem::replace(&mut v[i], Val::void()));
                             break
                         },
                         Embed(..) => {
@@ -436,14 +444,17 @@ impl Val {
                 if e.len() == 1 {
                     match e.get_tup_mut() {
                         Some(ref mut v) if v.len() == 1 => {
-                            let mut tmp = Val::void();
-                            ::std::mem::swap(&mut tmp, &mut v[0]);
-                            new_val = Some(tmp)
+                            new_val = Some(::std::mem::replace(&mut v[0], Val::void()));
                         },
                         _ => {}
                     }
                 }
             },
+            &mut Error(ref mut e) => {
+                if let Some(r) = Rc::get_mut(e) {
+                    r.0.eval();
+                }
+            }
             _ => {},
         }
 
@@ -464,10 +475,29 @@ impl Val {
         }
     }
 
+    pub fn get_usize(&self) -> Option<usize> {
+        if let &Val::Str(ref s) = self {
+            if let Ok(i) = str::parse::<usize>(s.as_str()) {
+                Some(i)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     pub fn get_str(&self) -> Option<&str> {
         match *self {
             Val::Str(ref s) => Some(s),
             Val::Tup(ref t) if t.len() == 1 => t[0].get_str(),
+            _ => None,
+        }
+    }
+
+    pub fn get_scalar_str(&self) -> Option<&str> {
+        match *self {
+            Val::Str(ref s) => Some(s),
             _ => None,
         }
     }
@@ -477,6 +507,14 @@ impl Val {
             Val::Str(ref s) => Some(Borrowed(s)),
             Val::Ref(ref r) => r.with_ref(|x| x.get_string().map(|x| { Owned(x) })),
             Val::Tup(ref t) if t.len() == 1 => t[0].get_cowstr(),
+            _ => None,
+        }
+    }
+
+    pub fn get_scalar_cowstr(&self) -> Option<Cow<str>> {
+        match *self {
+            Val::Str(ref s) => Some(Borrowed(s)),
+            Val::Ref(ref r) => r.with_ref(|x| x.get_string().map(|x| { Owned(x) })),
             _ => None,
         }
     }
@@ -585,32 +623,43 @@ impl Val {
     }
 
     pub fn is_err(&self) -> bool {
-        if let Val::Error(..) = *self {
-            true
+        self.with_val(|v| {
+            if let Val::Error(..) = *v {
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn get_err_val(&self) -> Option<Val> {
+        if let Val::Error(ref e) = *self {
+            Some((*e.0).clone())
         } else {
-            false
+            None
         }
     }
 
     pub fn err_str(val: &str) -> Val {
-        Self::custom_err(vec![Val::str(val)], None)
+        Self::custom_err(Val::str(val), None)
     }
 
     pub fn err_string(val: String) -> Val {
-        Self::custom_err(vec![Val::Str(val)], None)
+        Self::custom_err(Val::Str(val), None)
     }
 
     pub fn ok(val: Val) -> Val {
         Val::Tup(vec![Val::str("Ok"), val])
     }
 
-    pub fn custom_err(v: Vec<Val>, span: Option<Span>) -> Val {
-        Val::err(RuntimeError::CustomError(v), span)
+    pub fn custom_err(v: Val, span: Option<Span>) -> Val {
+        Val::err(RuntimeError::CustomError(Box::new(v)), span)
     }
+
     pub fn err(e: RuntimeError, span: Option<Span>) -> Val {
         let v = match e {
             RuntimeError::CustomError(v) => v,
-            _ => vec![e.into()],
+            _ => Box::new(e.into()),
         };
         if let Some(span) = span {
             Val::Error(Rc::new((v, false.into(), vec![span])))
@@ -635,10 +684,47 @@ impl Val {
         ValIter::from_val(self)
     }
 
+    pub fn err_format(&self) -> String {
+        match *self {
+            Val::Str(ref s) => s.clone(),
+            Val::Tup(ref t) => if t.len() == 0 {
+                "()".into()
+            } else {
+                if let Some(s) = t[0].get_string() {
+                    if ::rush_parser::lex::is_identifier(&s) {
+                        return s + "(" + &t[1..].iter().map(|x| format!("{}", x.repr())).collect::<Vec<_>>().join(", ") + ")"
+                    }
+                }
+                self.repr()
+            },
+            Val::Ref(ref r) => r.get().err_format(),
+            Val::Embed(ref e) => e.err_format(),
+            Val::Error(ref e) => {
+                let span = e.2.first().map(|x| *x).unwrap_or(Span::zero());
+                format!("[{}:{}] Error: {}",
+                          span.l.line, span.l.col, e.0.err_format())
+            }
+        }
+    }
+
+    pub fn decay_err(self) -> Val {
+        if self.is_err() {
+            self.with_val(|v| {
+                if let Val::Error(ref e) = *v {
+                    let pos = e.2.first().map(|x| *x).unwrap_or(Span::zero()).l;
+                    e.1.set(true);
+                    Val::Tup(vec![Val::str("Err!"),
+                                  (*e.0).clone(),
+                                  Val::Tup(vec![Val::str(pos.line.to_string()),
+                                                Val::str(pos.col.to_string())])])
+                } else { unreachable!() }
+            }) } else { self }
+    }
+
     pub fn unhandled(&self) -> bool {
         if let Val::Error(ref e) = *self {
             if e.1.get() == false {
-                writeln!(&mut ::std::io::stderr(), "Warning: unhandled error {:?}", self).unwrap();
+                eprintln!("{}", self.err_format());
                 return true;
             }
         }
@@ -733,10 +819,10 @@ impl Val {
         ret
     }
 
-    pub fn with_index<'a, F>(&self, i: &Indexing<'a>, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
+    pub fn with_index<'a, F>(&self, i: &Indexing<'a>, f: &mut F) -> Result<(), Val> where F: ?Sized + (FnMut(&Val) -> ()) {
         use self::Val::*;
 
-        fn index_str<F>(val: &Val, i: &str, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
+        fn index_str<F>(val: &Val, i: &str, f: &mut F) -> Result<(), Val> where F: ?Sized + (FnMut(&Val) -> ()) {
             let mut found = false;
             Cow::from(val).for_each_shallow(&mut |val: Cow<Val>| {
                 match *(val.as_ref()) {
@@ -756,10 +842,10 @@ impl Val {
             }
         }
 
-        fn index_int<F>(val: &Val, idx: i64, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
-            match val {
-                &Ref(ref r) => return r.with_ref(|x| index_int(x, idx, f)),
-                &Tup(ref v) => {
+        fn index_int<F>(val: &Val, idx: i64, f: &mut F) -> Result<(), Val> where F: ?Sized + (FnMut(&Val) -> ()) {
+            match *val {
+                Ref(ref r) => return r.with_ref(|x| index_int(x, idx, f)),
+                Tup(ref v) => {
                     let i = wrap_index(idx, v.len());
                     if i >= v.len() {
                         return Err(Val::err(RuntimeError::IndexOutOfRange{len: v.len(), idx}, None));
@@ -767,16 +853,7 @@ impl Val {
                     f(&v[i]);
                     return Ok(());
                 },
-                &Error(ref e) => {
-                    e.1.set(true);
-                    let i = wrap_index(idx, e.0.len() + 1);
-                    if i == 0 { f(&Val::str("Err!")); return Ok(()) }
-                    if i - 1 < e.0.len() {
-                        f(&e.0[i - 1]);
-                        return Ok(());
-                    }
-                    return Err(Val::err(RuntimeError::IndexOutOfRange{len: e.0.len() + 1, idx}, None));
-                }
+                Error(..) => { unimplemented!() }
                 _ => if idx == 0 || idx == -1 { f(val); return Ok(()); } else {
                     return Err(Val::err(RuntimeError::IndexOutOfRange{len: 1, idx}, None));
                 },
@@ -785,9 +862,9 @@ impl Val {
 
         use std::slice::SliceIndex;
 
-        fn index_slice<F, S: SliceIndex<[Val], Output = [Val]> + ::std::fmt::Debug>(val: &Val, s: S, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
-            match val {
-                &Tup(ref v) => {
+        fn index_slice<F, S: SliceIndex<[Val], Output = [Val]> + ::std::fmt::Debug>(val: &Val, s: S, f: &mut F) -> Result<(), Val> where F: ?Sized + (FnMut(&Val) -> ()) {
+            match *val {
+                Tup(ref v) => {
                     match v.get(s) {
                         Some(v) => {
                             f(&Val::Tup(v.iter().cloned().collect()));
@@ -800,21 +877,16 @@ impl Val {
             }
         }
 
-        fn index_range<F>(val: &Val, r: &Range, f: &mut F) -> Result<(), Val> where F: (FnMut(&Val) -> ()) {
+        fn index_range<F>(val: &Val, r: &Range, f: &mut F) -> Result<(), Val> where F: ?Sized + (FnMut(&Val) -> ()) {
             match *val {
                 Ref(ref rf) => return rf.with_ref(|x| index_range(x, r, f)),
-                Error(ref e) => {
-                    let mut v = Vec::with_capacity(1 + e.0.len());
-                    v.push(Val::str("Err!"));
-                    v.extend_from_slice(&e.0[..]);
-                    return index_range(&Tup(v), r, f);
-                },
+                Error(..) => { unimplemented!() },
                 Tup(ref v) => {
                     match *r {
                         Range::All => { f(val); return Ok(()) },
                         Range::FromInt(l) => index_slice(val, wrap_index(l, v.len()).., f),
-                        Range::TillInt(r) => index_slice(val, ...wrap_index(r, v.len()), f),
-                        Range::WithinInt(l, r) => index_slice(val, wrap_index(l, v.len())...wrap_index(r, v.len()), f),
+                        Range::TillInt(r) => index_slice(val, ..=wrap_index(r, v.len()), f),
+                        Range::WithinInt(l, r) => index_slice(val, wrap_index(l, v.len())..=wrap_index(r, v.len()), f),
                         _ => Err(Val::err(RuntimeError::InvalidIndex(Box::new(r.as_val()), "Index must be a scalar or non-negative integer range"), None))
                     }
                 },
@@ -826,6 +898,25 @@ impl Val {
             Indexing::Offset(o) => index_int(self, o, f),
             Indexing::Dict(k) => index_str(self, k, f),
             Indexing::Range(ref r) => index_range(self, r, f),
+            Indexing::Multiple(ref v) => {
+                let mut vec = Vec::with_capacity(v.len());
+                for i in v {
+                    if let Err(e) = self.with_index(i, (&mut |val: &Val| {
+                        if let Some(tup) = val.get_tup() {
+                            if let Indexing::Range(_) = *i {
+                                vec.extend(tup.clone());
+                                return
+                            }
+                        }
+                        vec.push(val.clone())
+                    }) as (&mut FnMut(&Val)->()) ) {
+                        return Err(e)
+                    }
+                }
+                let val = Val::Tup(vec);
+                f(&val);
+                Ok( () )
+            },
         }
     }
 
@@ -862,24 +953,7 @@ impl Val {
                     }
                     return Ok(());
                 },
-                Error(ref mut e) => {
-                    if let Some(e) = Rc::get_mut(e) {
-                        e.1.set(true);
-                        let i = wrap_index(idx, e.0.len() + 1);
-                        if i == 0 {
-                            let mut val = Val::str("Err!");
-                            f(&mut val);
-                            return Ok(())
-                        }
-                        if i - 1 < e.0.len() {
-                            f(&mut e.0[i - 1]);
-                            return Ok(());
-                        }
-                        return Err(Val::err(RuntimeError::IndexOutOfRange{len: e.0.len() + 1, idx}, None));
-                    } else {
-                        return Err(Val::err_str("Tried to modify shared error value"));
-                    }
-                }
+                Error(..) => { unimplemented!() }
                 _ => if idx == 0 || idx == -1 { f(val); return Ok(()); } else {
                     let mut tmp = Val::void();
                     ::std::mem::swap(&mut tmp, val);
@@ -975,13 +1049,13 @@ impl Val {
                             let iter = iter.chain(repeat(Val::void()).take((-r - 1) as usize));
                             cur.splice(0..0, iter);
                         } else if r < n {
-                            cur.splice(0...r as usize, iter);
+                            cur.splice(0..=r as usize, iter);
                         } else {
                             *cur = iter.collect();
                         }
                     } else if l < n {
                         if r < n {
-                            cur.splice(l as usize...r as usize, iter);
+                            cur.splice(l as usize..=r as usize, iter);
                         } else {
                             cur.splice(l as usize..n as usize, iter);
                         }
@@ -1001,6 +1075,7 @@ impl Val {
             Indexing::Offset(o) => index_int(self, o, f),
             Indexing::Dict(k) => index_str(self, k, f),
             Indexing::Range(ref r) => index_range(self, r, f),
+            Indexing::Multiple(ref _v) => { Ok( () ) },
         }
     }
 }
@@ -1127,11 +1202,8 @@ impl<'a> InternalIterable for Cow<'a, Val> {
                 },
                 Owned(Error(ref e)) | Borrowed(&Error(ref e)) => {
                     e.1.set(true);
-                    let depth = depth.inc();
                     f(Owned("Err!".into()));
-                    for x in e.0.iter() {
-                        if !imp(Borrowed(x), f, depth) { return false }
-                    }
+                    if !imp(Borrowed(&*e.0), f, depth) { return false }
                     return true;
                 },
             };
@@ -1176,9 +1248,7 @@ impl<'a> InternalIterable for Cow<'a, Val> {
                     e.1.set(true);
                     let depth = depth + 1;
                     f(Owned("Err!".into()), depth);
-                    for x in e.0.iter() {
-                        if !imp(Borrowed(x), f, depth, flatten) { return false }
-                    }
+                    if !imp(Borrowed(&*e.0), f, depth, flatten) { return false }
                     return true;
                 },
             };
@@ -1346,7 +1416,6 @@ impl<'a> From<&'a Regex> for Val {
 fn for_each_shallow_mut<'a, F>(this: &'a mut Val, f: &mut F) -> bool where F: (FnMut(&mut Val) -> bool) {
     fn imp<'a, F>(this: &'a mut Val, f: &mut F, depth: Depth) -> bool where F: (FnMut(&mut Val) -> bool) {
         use self::Val::*;
-        use std::rc::Rc;
 
         match *this {
             Str(_) => { return f(this); },
@@ -1367,24 +1436,7 @@ fn for_each_shallow_mut<'a, F>(this: &'a mut Val, f: &mut F) -> bool where F: (F
                 let vref = r.clone();
                 return vref.with_mut(|x| imp(x, f, depth.enter_ref()));
             },
-            Error(ref mut e) => {
-                if let Some(e) = Rc::get_mut(e) {
-                    e.1.set(true);
-                    let depth = depth.inc();
-                    let mut first = Val::str("Err!");
-                    f(&mut first);
-                    if first.get_str() != Some("Err!") {
-                        unimplemented!();
-                    }
-                    let tup = &mut e.0;
-                    for x in tup.iter_mut() {
-                        if !imp(x, f, depth) { return false }
-                    }
-                    return true;
-                } else {
-                    return true;
-                }
-            },
+            Error(..) => { return true; },
         };
     };
     return imp(this, f, Depth::default())
